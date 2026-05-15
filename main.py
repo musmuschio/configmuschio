@@ -44,7 +44,7 @@ def get_balance():
 
 def trade_engine():
     print("==================================================")
-    print(f"🚀 MESIN TRADING REAL V2.2 (API BYPASS) 🚀")
+    print(f"🚀 MESIN TRADING REAL V2.3 (API BYPASS + PRICE FIX) 🚀")
     print(f"Target: {SYMBOL} | Amunisi per Trade: Rp{BUY_AMOUNT_IDR}")
     print("==================================================\n")
     
@@ -68,17 +68,18 @@ def trade_engine():
             
             waktu = datetime.now().strftime('%H:%M:%S')
             
-            # --- LOGIKA EKSEKUSI (BYPASS CCXT API) ---
+            # --- LOGIKA EKSEKUSI (BYPASS CCXT API + PRICE FIX) ---
             
-            # 🟢 KONDISI BELI (Direct API Hit)
+            # 🟢 KONDISI BELI
             if rsi < 30 and current_price <= low_bb and not in_pos:
                 if idr_now >= BUY_AMOUNT_IDR:
                     print(f"[{waktu}] 🟢 MENGEKSEKUSI BELI Rp{BUY_AMOUNT_IDR}...")
                     
-                    # Bypass fungsi standar, hajar Native API Trade
+                    # Tambahkan parameter 'price' (di-convert ke int agar bulat)
                     order = EXCHANGE.private_post_trade({
                         'pair': 'btc_idr',
                         'type': 'buy',
+                        'price': int(current_price),
                         'rupiah': BUY_AMOUNT_IDR
                     })
                     
@@ -88,7 +89,7 @@ def trade_engine():
                 else:
                     print(f"[{waktu}] ⚠️ Sinyal BUY muncul, tapi saldo IDR tidak cukup!")
 
-            # 🔴 KONDISI JUAL (Direct API Hit)
+            # 🔴 KONDISI JUAL
             elif rsi > 70 and current_price >= up_bb and in_pos:
                 if btc_now > 0.00001:
                     print(f"[{waktu}] 🔴 MENGEKSEKUSI JUAL SEMUA BTC...")
@@ -96,6 +97,7 @@ def trade_engine():
                     order = EXCHANGE.private_post_trade({
                         'pair': 'btc_idr',
                         'type': 'sell',
+                        'price': int(current_price),
                         'btc': btc_now
                     })
                     
@@ -120,4 +122,3 @@ if __name__ == "__main__":
         trade_engine()
     except KeyboardInterrupt:
         print("\nMesin dinonaktifkan.")
-                    
