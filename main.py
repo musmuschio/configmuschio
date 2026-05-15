@@ -17,9 +17,10 @@ EXCHANGE = ccxt.indodax({
 
 SYMBOL = 'BTC/IDR'
 TIMEFRAME = '1m'
-BUY_AMOUNT_IDR = 10000  # Amunisi 50rb kamu
+BUY_AMOUNT_IDR = 10000  # Amunisi Eksekusi: Rp 10.000
 
 def calculate_rsi(series, period=14):
+    """Kalkulasi RSI Murni"""
     delta = series.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
@@ -27,6 +28,7 @@ def calculate_rsi(series, period=14):
     return 100 - (100 / (1 + rs))
 
 def calculate_bollinger_bands(series, window=20, std_dev=2):
+    """Kalkulasi BB Murni"""
     sma = series.rolling(window=window).mean()
     std = series.rolling(window=window).std()
     upper = sma + (std_dev * std)
@@ -34,10 +36,11 @@ def calculate_bollinger_bands(series, window=20, std_dev=2):
     return upper, lower
 
 def get_balance():
-    """Mengambil saldo IDR dan BTC saat ini"""
+    """Mengambil saldo dengan aman"""
     balance = EXCHANGE.fetch_balance()
-    idr_balance = balance['free']['IDR']
-    btc_balance = balance['free']['BTC']
+    # Menggunakan .get() agar tidak error jika koin benar-benar kosong
+    idr_balance = balance['free'].get('IDR', 0.0)
+    btc_balance = balance['free'].get('BTC', 0.0)
     return idr_balance, btc_balance
 
 def trade_engine():
@@ -46,14 +49,16 @@ def trade_engine():
     print(f"Target: {SYMBOL} | Amunisi per Trade: Rp{BUY_AMOUNT_IDR}")
     print("==================================================\n")
     
-    # Cek apakah mesin punya posisi BTC saat startup
+    # Cek status awal
     _, btc_start = get_balance()
     in_pos = True if btc_start > 0.00001 else False
     
     while True:
         try:
-            # Ambil data saldo dan harga
+            # Ambil data saldo terkini
             idr_now, btc_now = get_balance()
+            
+            # Tarik data pasar
             bars = EXCHANGE.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=50)
             df = pd.DataFrame(bars, columns=['t', 'o', 'h', 'l', 'c', 'v'])
             close_prices = df['c']
@@ -68,30 +73,29 @@ def trade_engine():
             
             waktu = datetime.now().strftime('%H:%M:%S')
             
-            # --- LOGIKA EKSEKUSI NYATA ---
+            # --- LOGIKA EKSEKUSI ---
             
-            # 🟢 KONDISI BELI (BUY)
+            # 🟢 KONDISI BELI (Oversold & Sentuh Bawah)
             if rsi < 30 and current_price <= low_bb and not in_pos:
                 if idr_now >= BUY_AMOUNT_IDR:
-                    print(f"[{waktu}] 🟢 MENGEKSEKUSI BELI...")
-                    # Indodax Market Buy: Mengirim total IDR yang ingin dibelanjakan
+                    print(f"[{waktu}] 🟢 MENGEKSEKUSI BELI Rp10.000...")
                     order = EXCHANGE.create_market_buy_order(SYMBOL, BUY_AMOUNT_IDR)
-                    print(f"[{waktu}] ✅ BERHASIL BELI | Info: {order['id']}")
+                    print(f"[{waktu}] ✅ BERHASIL BELI | Order ID: {order['id']}")
                     in_pos = True
                 else:
                     print(f"[{waktu}] ⚠️ Sinyal BUY muncul, tapi saldo IDR tidak cukup!")
 
-            # 🔴 KONDISI JUAL (SELL)
+            # 🔴 KONDISI JUAL (Overbought & Sentuh Atas)
             elif rsi > 70 and current_price >= up_bb and in_pos:
                 if btc_now > 0.00001:
-                    print(f"[{waktu}] 🔴 MENGEKSEKUSI JUAL...")
-                    # Indodax Market Sell: Mengirim jumlah BTC yang ingin dijual
+                    print(f"[{waktu}] 🔴 MENGEKSEKUSI JUAL SEMUA BTC...")
                     order = EXCHANGE.create_market_sell_order(SYMBOL, btc_now)
-                    print(f"[{waktu}] ✅ BERHASIL JUAL | Info: {order['id']}")
+                    print(f"[{waktu}] ✅ BERHASIL JUAL | Order ID: {order['id']}")
                     in_pos = False
                 else:
                     print(f"[{waktu}] ⚠️ Sinyal SELL muncul, tapi saldo BTC kosong!")
 
+            # 🔍 SCANNING (Menunggu)
             else:
                 status = "HOLDING BTC" if in_pos else "WAITING SIGNAL"
                 print(f"[{waktu}] 🔍 {status} | Harga: Rp{current_price:,.0f} | RSI: {rsi:.2f}")
@@ -99,48 +103,12 @@ def trade_engine():
         except Exception as e:
             print(f"[{datetime.now().strftime('%H:%M:%S')}] ⚠️ Terjadi kendala: {e}")
             
-        time.sleep(15) # Jeda agar tidak terkena limit API Indodax
+        # Jeda 15 detik (Aman dari limit server Indodax)
+        time.sleep(15)
 
 if __name__ == "__main__":
     try:
         trade_engine()
     except KeyboardInterrupt:
         print("\nMesin dinonaktifkan.")
-        # Tarik Data Harga Terkini
-            bars = EXCHANGE.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=50)
-            df = pd.DataFrame(bars, columns=['t', 'o', 'h', 'l', 'c', 'v'])
-            close_prices = df['c']
             
-            # Eksekusi Rumus Matematika
-            rsi = calculate_rsi(close_prices).iloc[-1]
-            upper_bb, lower_bb = calculate_bollinger_bands(close_prices)
-            
-            current_price = close_prices.iloc[-1]
-            low_bb = lower_bb.iloc[-1]
-            up_bb = upper_bb.iloc[-1]
-            
-            waktu = datetime.now().strftime('%H:%M:%S')
-            
-            # Logika Pemicu (Trigger)
-            if rsi < 30 and current_price <= low_bb and not in_pos:
-                print(f"[{waktu}] 🟢 [BUY EKSEKUSI] Harga: ${current_price} | RSI: {rsi:.2f}")
-                in_pos = True
-            elif rsi > 70 and current_price >= up_bb and in_pos:
-                print(f"[{waktu}] 🔴 [SELL EKSEKUSI] Harga: ${current_price} | RSI: {rsi:.2f}")
-                in_pos = False
-            else:
-                # Log pemantauan datar
-                status = "HOLDING" if in_pos else "SCANNING"
-                print(f"[{waktu}] 🔍 {status} | Harga: ${current_price} | RSI: {rsi:.2f} | BB_Low: ${low_bb:.1f}")
-                
-        except Exception as e:
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] ⚠️ Koneksi terputus/Error: {e}")
-            
-        # Jeda 10 detik agar tidak diblokir Binance
-        time.sleep(10)
-
-if __name__ == "__main__":
-    try:
-        trade_engine()
-    except KeyboardInterrupt:
-        print("\nMesin dimatikan secara manual.")
