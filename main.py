@@ -38,32 +38,27 @@ def calculate_bollinger_bands(series, window=20, std_dev=2):
 def get_balance():
     """Mengambil saldo dengan aman"""
     balance = EXCHANGE.fetch_balance()
-    # Menggunakan .get() agar tidak error jika koin benar-benar kosong
     idr_balance = balance['free'].get('IDR', 0.0)
     btc_balance = balance['free'].get('BTC', 0.0)
     return idr_balance, btc_balance
 
 def trade_engine():
     print("==================================================")
-    print(f"🚀 MESIN TRADING REAL V2.0 (LIVE ON INDODAX) 🚀")
+    print(f"🚀 MESIN TRADING REAL V2.1 (LIVE ON INDODAX) 🚀")
     print(f"Target: {SYMBOL} | Amunisi per Trade: Rp{BUY_AMOUNT_IDR}")
     print("==================================================\n")
     
-    # Cek status awal
     _, btc_start = get_balance()
     in_pos = True if btc_start > 0.00001 else False
     
     while True:
         try:
-            # Ambil data saldo terkini
             idr_now, btc_now = get_balance()
             
-            # Tarik data pasar
             bars = EXCHANGE.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=50)
             df = pd.DataFrame(bars, columns=['t', 'o', 'h', 'l', 'c', 'v'])
             close_prices = df['c']
             
-            # Hitung Indikator
             rsi = calculate_rsi(close_prices).iloc[-1]
             upper_bb, lower_bb = calculate_bollinger_bands(close_prices)
             
@@ -75,27 +70,31 @@ def trade_engine():
             
             # --- LOGIKA EKSEKUSI ---
             
-            # 🟢 KONDISI BELI (Oversold & Sentuh Bawah)
+            # 🟢 KONDISI BELI (Diperbarui untuk Indodax)
             if rsi < 30 and current_price <= low_bb and not in_pos:
                 if idr_now >= BUY_AMOUNT_IDR:
-                    print(f"[{waktu}] 🟢 MENGEKSEKUSI BELI Rp10.000...")
-                    order = EXCHANGE.create_market_buy_order(SYMBOL, BUY_AMOUNT_IDR)
-                    print(f"[{waktu}] ✅ BERHASIL BELI | Order ID: {order['id']}")
+                    print(f"[{waktu}] 🟢 MENGEKSEKUSI BELI Rp{BUY_AMOUNT_IDR}...")
+                    
+                    # Kalkulasi estimasi keping koin untuk memenuhi standar library
+                    estimasi_coin = BUY_AMOUNT_IDR / current_price
+                    # Eksekusi dengan parameter 'cost' (Rupiah murni)
+                    order = EXCHANGE.create_order(SYMBOL, 'market', 'buy', estimasi_coin, None, {'cost': BUY_AMOUNT_IDR})
+                    
+                    print(f"[{waktu}] ✅ BERHASIL BELI | Info: {order['id']}")
                     in_pos = True
                 else:
                     print(f"[{waktu}] ⚠️ Sinyal BUY muncul, tapi saldo IDR tidak cukup!")
 
-            # 🔴 KONDISI JUAL (Overbought & Sentuh Atas)
+            # 🔴 KONDISI JUAL
             elif rsi > 70 and current_price >= up_bb and in_pos:
                 if btc_now > 0.00001:
                     print(f"[{waktu}] 🔴 MENGEKSEKUSI JUAL SEMUA BTC...")
                     order = EXCHANGE.create_market_sell_order(SYMBOL, btc_now)
-                    print(f"[{waktu}] ✅ BERHASIL JUAL | Order ID: {order['id']}")
+                    print(f"[{waktu}] ✅ BERHASIL JUAL | Info: {order['id']}")
                     in_pos = False
                 else:
                     print(f"[{waktu}] ⚠️ Sinyal SELL muncul, tapi saldo BTC kosong!")
 
-            # 🔍 SCANNING (Menunggu)
             else:
                 status = "HOLDING BTC" if in_pos else "WAITING SIGNAL"
                 print(f"[{waktu}] 🔍 {status} | Harga: Rp{current_price:,.0f} | RSI: {rsi:.2f}")
@@ -103,7 +102,6 @@ def trade_engine():
         except Exception as e:
             print(f"[{datetime.now().strftime('%H:%M:%S')}] ⚠️ Terjadi kendala: {e}")
             
-        # Jeda 15 detik (Aman dari limit server Indodax)
         time.sleep(15)
 
 if __name__ == "__main__":
@@ -111,4 +109,4 @@ if __name__ == "__main__":
         trade_engine()
     except KeyboardInterrupt:
         print("\nMesin dinonaktifkan.")
-            
+        
