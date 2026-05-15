@@ -44,7 +44,7 @@ def get_balance():
 
 def trade_engine():
     print("==================================================")
-    print(f"🚀 MESIN TRADING REAL V2.1 (LIVE ON INDODAX) 🚀")
+    print(f"🚀 MESIN TRADING REAL V2.2 (API BYPASS) 🚀")
     print(f"Target: {SYMBOL} | Amunisi per Trade: Rp{BUY_AMOUNT_IDR}")
     print("==================================================\n")
     
@@ -68,33 +68,44 @@ def trade_engine():
             
             waktu = datetime.now().strftime('%H:%M:%S')
             
-            # --- LOGIKA EKSEKUSI ---
+            # --- LOGIKA EKSEKUSI (BYPASS CCXT API) ---
             
-            # 🟢 KONDISI BELI (Diperbarui untuk Indodax)
+            # 🟢 KONDISI BELI (Direct API Hit)
             if rsi < 30 and current_price <= low_bb and not in_pos:
                 if idr_now >= BUY_AMOUNT_IDR:
                     print(f"[{waktu}] 🟢 MENGEKSEKUSI BELI Rp{BUY_AMOUNT_IDR}...")
                     
-                    # Kalkulasi estimasi keping koin untuk memenuhi standar library
-                    estimasi_coin = BUY_AMOUNT_IDR / current_price
-                    # Eksekusi dengan parameter 'cost' (Rupiah murni)
-                    order = EXCHANGE.create_order(SYMBOL, 'market', 'buy', estimasi_coin, None, {'cost': BUY_AMOUNT_IDR})
+                    # Bypass fungsi standar, hajar Native API Trade
+                    order = EXCHANGE.private_post_trade({
+                        'pair': 'btc_idr',
+                        'type': 'buy',
+                        'rupiah': BUY_AMOUNT_IDR
+                    })
                     
-                    print(f"[{waktu}] ✅ BERHASIL BELI | Info: {order['id']}")
+                    order_id = order.get('return', {}).get('order_id', 'Unknown')
+                    print(f"[{waktu}] ✅ BERHASIL BELI | Info ID: {order_id}")
                     in_pos = True
                 else:
                     print(f"[{waktu}] ⚠️ Sinyal BUY muncul, tapi saldo IDR tidak cukup!")
 
-            # 🔴 KONDISI JUAL
+            # 🔴 KONDISI JUAL (Direct API Hit)
             elif rsi > 70 and current_price >= up_bb and in_pos:
                 if btc_now > 0.00001:
                     print(f"[{waktu}] 🔴 MENGEKSEKUSI JUAL SEMUA BTC...")
-                    order = EXCHANGE.create_market_sell_order(SYMBOL, btc_now)
-                    print(f"[{waktu}] ✅ BERHASIL JUAL | Info: {order['id']}")
+                    
+                    order = EXCHANGE.private_post_trade({
+                        'pair': 'btc_idr',
+                        'type': 'sell',
+                        'btc': btc_now
+                    })
+                    
+                    order_id = order.get('return', {}).get('order_id', 'Unknown')
+                    print(f"[{waktu}] ✅ BERHASIL JUAL | Info ID: {order_id}")
                     in_pos = False
                 else:
                     print(f"[{waktu}] ⚠️ Sinyal SELL muncul, tapi saldo BTC kosong!")
 
+            # 🔍 SCANNING
             else:
                 status = "HOLDING BTC" if in_pos else "WAITING SIGNAL"
                 print(f"[{waktu}] 🔍 {status} | Harga: Rp{current_price:,.0f} | RSI: {rsi:.2f}")
@@ -109,4 +120,4 @@ if __name__ == "__main__":
         trade_engine()
     except KeyboardInterrupt:
         print("\nMesin dinonaktifkan.")
-        
+                    
