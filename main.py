@@ -3,102 +3,139 @@ import time
 import pandas as pd
 from datetime import datetime
 
-# --- [ CONFIGURATION: THE SYNDICATE HQ ] ---
+# ==========================================
+# [1] KONFIGURASI UTAMA (THE SYNDICATE HQ)
+# ==========================================
 API_KEY = 'YOUR_API_KEY'
 SECRET_KEY = 'YOUR_SECRET_KEY'
-SYMBOL = 'BTC/IDR'
-BUY_AMOUNT_IDR = 25000   # Amunisi per tembakan
-RSI_PERIOD = 14
-RSI_OVERSOLD = 30        # Target beli (RSI di bawah ini)
-MIN_BALANCE_IDR = 10000  # Batas aman Indodax
 
-# Inisialisasi Koneksi
+SYMBOL = 'BTC/IDR'
+BUY_AMOUNT_IDR = 25000   # Amunisi tembakan (Rupiah Bulat)
+
+# Parameter Indikator
+RSI_PERIOD = 14
+RSI_OVERSOLD = 30
+SCAN_INTERVAL = 15       # Jeda antar cek pasar (detik)
+COOLDOWN = 600           # Jeda istirahat setelah berhasil beli (detik)
+
+# ==========================================
+# [2] INISIALISASI & LOGGER
+# ==========================================
 exchange = ccxt.indodax({
     'apiKey': API_KEY,
     'secret': SECRET_KEY,
     'enableRateLimit': True,
 })
 
-def log(msg, type="INFO"):
+def log(msg, level="INFO"):
+    icons = {"INFO": "ℹ️", "SUCCESS": "✅", "WARN": "⚠️", "ERROR": "❌", "EXEC": "🚀", "BRAIN": "🧠", "MONEY": "💰"}
     now = datetime.now().strftime("%H:%M:%S")
-    icon = {"INFO": "ℹ️", "SUCCESS": "✅", "WARN": "⚠️", "ERROR": "🚨", "EXEC": "🚀"}
-    print(f"[{now}] {icon.get(type, '🔹')} {msg}")
+    print(f"[{now}] {icons.get(level, '🔹')} {msg}")
 
-def hitung_rsi_manual(series, period=14):
-    """Rumus RSI Standar (Tanpa Library Eksternal)"""
-    delta = series.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    rs = gain / loss
-    return 100 - (100 / (1 + rs))
-
-def cek_saldo_idr():
+# ==========================================
+# [3] SISTEM KECERDASAN (TANPA PANDAS_TA)
+# ==========================================
+def analisa_market():
     try:
-        balance = exchange.fetch_balance()
-        free_idr = balance.get('IDR', {}).get('free', 0)
-        return int(free_idr)
-    except Exception as e:
-        log(f"Gagal akses saldo: {e}", "ERROR")
-        return 0
-
-def eksekusi_beli_final(amount):
-    try:
-        saldo_sekarang = cek_saldo_idr()
-        log(f"Audit Saldo: Rp{saldo_sekarang} tersedia di dompet.", "INFO")
-
-        if saldo_sekarang < amount:
-            log(f"Amunisi kurang! Butuh Rp{amount}, cuma ada Rp{saldo_sekarang}.", "WARN")
-            return False
-
-        log(f"Mendobrak sistem Indodax dengan nominal Rp{int(amount)}...", "EXEC")
-        
-        # PARAMETER KRITIKAL: Menggunakan 'idr' untuk Market Buy V2
-        params = {
-            'pair': SYMBOL.replace('/', '_').lower(),
-            'type': 'buy',
-            'idr': int(amount) 
-        }
-        
-        response = exchange.private_post_trade(params)
-        
-        if response.get('success') == '1' or response.get('success') == 1:
-            log(f"TEMBAKAN BERHASIL! {SYMBOL} terbeli senilai Rp{amount}.", "SUCCESS")
-            return True
-        else:
-            pesan_error = response.get('error', 'Unknown Rejected')
-            log(f"Ditolak Indodax: {pesan_error}", "ERROR")
-            return False
-            
-    except Exception as e:
-        log(f"Kegagalan Komunikasi API: {e}", "ERROR")
-        return False
-
-# --- [ MAIN LOOP: OPERASIONAL SYNDICATE ] ---
-log(f"AsTraDax V2.6 Aktif. Mengawasi {SYMBOL}...", "SUCCESS")
-
-while True:
-    try:
-        # 1. Ambil Data Market
-        bars = exchange.fetch_ohlcv(SYMBOL, timeframe='1m', limit=50)
+        # Ambil data lilin (candlestick) 1 menit terakhir
+        bars = exchange.fetch_ohlcv(SYMBOL, timeframe='1m', limit=100)
         df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         
-        # 2. Analisa Indikator
-        df['rsi'] = hitung_rsi_manual(df['close'], RSI_PERIOD)
-        current_rsi = df['rsi'].iloc[-1]
-        current_price = df['close'].iloc[-1]
+        # 1. Hitung RSI
+        delta = df['close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=RSI_PERIOD).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=RSI_PERIOD).mean()
+        rs = gain / loss
+        df['rsi'] = 100 - (100 / (1 + rs))
+
+        # 2. Hitung MACD (12, 26, 9)
+        exp1 = df['close'].ewm(span=12, adjust=False).mean()
+        exp2 = df['close'].ewm(span=26, adjust=False).mean()
+        df['macd'] = exp1 - exp2
+        df['macd_signal'] = df['macd'].ewm(span=9, adjust=False).mean()
+        df['macd_hist'] = df['macd'] - df['macd_signal']
+
+        # 3. Hitung Bollinger Bands (SMA 20)
+        df['bb_mid'] = df['close'].rolling(window=20).mean()
+        df['bb_std'] = df['close'].rolling(window=20).std()
+        df['bb_lower'] = df['bb_mid'] - (2 * df['bb_std'])
         
-        # 3. Alert Detail ke Terminal
-        status_msg = f"Price: {current_price} | RSI: {current_rsi:.2f}"
-        if current_rsi <= RSI_OVERSOLD:
-            log(f"{status_msg} -> [KONDISI TERPENUHI]", "SUCCESS")
-            if eksekusi_beli_final(BUY_AMOUNT_IDR):
-                log("Istirahat 10 menit untuk menghindari over-trading.", "INFO")
-                time.sleep(600)
-        else:
-            # Alert tipis agar terminal tidak sepi tapi tidak spam
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] 🧐 Memantau... {status_msg} (Target: <{RSI_OVERSOLD})", end='\r')
-            
+        return df
     except Exception as e:
-        log(f"Loop Error: {e}", "ERROR")
+        log(f"Gagal mengambil data market: {e}", "ERROR")
+        return None
+
+# ==========================================
+# [4] AUDIT SALDO & EKSEKUSI (ANTI-ERROR)
+# ==========================================
+def eksekusi_beli_pasti():
+    try:
+        # LANGKAH 1: Cek Saldo Real-time di Indodax
+        log("Mengakses brankas Indodax untuk cek saldo...", "INFO")
+        balance = exchange.fetch_balance()
+        idr_tersedia = balance.get('IDR', {}).get('free', 0)
+        
+        log(f"Saldo IDR Anda saat ini: Rp {int(idr_tersedia):,}", "MONEY")
+        
+        # LANGKAH 2: Validasi Amunisi
+        if idr_tersedia < BUY_AMOUNT_IDR:
+            log(f"Amunisi kurang! Bot butuh Rp {BUY_AMOUNT_IDR}, tapi saldo cuma Rp {int(idr_tersedia)}.", "WARN")
+            return False
+            
+        # LANGKAH 3: Tembak Langsung (Bypass Pembulatan Koin)
+        log(f"Mengeksekusi BELI {SYMBOL} senilai Rp {BUY_AMOUNT_IDR}...", "EXEC")
+        
+        # Ini adalah jalur khusus API Indodax. Meminta beli berdasarkan RUPIAH, bukan Koin.
+        order = exchange.private_post_trade({
+            'pair': SYMBOL.replace('/', '_').lower(),
+            'type': 'buy',
+            'idr': int(BUY_AMOUNT_IDR)
+        })
+        
+        # LANGKAH 4: Konfirmasi Sukses
+        if order.get('success') == 1 or order.get('success') == '1':
+            detail = order.get('return', {})
+            terima = detail.get('receive_btc', 'koin')
+            log(f"TRANSAKSI SUKSES! Saldo Rp{BUY_AMOUNT_IDR} telah ditukar menjadi {terima} {SYMBOL}.", "SUCCESS")
+            return True
+        else:
+            pesan_error = order.get('error', 'Unknown Error')
+            log(f"Transaksi Ditolak Server: {pesan_error}", "ERROR")
+            return False
+
+    except Exception as e:
+        log(f"Koneksi Eksekusi Terputus: {e}", "ERROR")
+        return False
+
+# ==========================================
+# [5] MAIN LOOP (KANTOR PUSAT)
+# ==========================================
+log(f"--- AsTraDax Ultimate Final (No-Simulasi) Aktif ---", "SUCCESS")
+log(f"Target: {SYMBOL} | Amunisi: Rp {BUY_AMOUNT_IDR} | Indikator: RSI, MACD, BB", "INFO")
+
+while True:
+    df = analisa_market()
     
-    time.sleep(10) # Interval scan pasar
+    if df is not None:
+        curr = df.iloc[-1]
+        
+        # Evaluasi Kecerdasan
+        rsi_ok = curr['rsi'] <= RSI_OVERSOLD
+        macd_ok = curr['macd_hist'] > 0  # Momentum mulai positif
+        bb_ok = curr['close'] <= curr['bb_lower'] # Menyentuh lantai bawah
+        
+        # Tampilkan status ke layar
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] 🧐 P:{curr['close']} | RSI:{curr['rsi']:.1f} | BB_Low:{curr['bb_lower']:.0f} | MACD:{curr['macd_hist']:.1f}", end='\r')
+        
+        # Jika ketiga indikator setuju (Triple Confirmation)
+        if rsi_ok and macd_ok and bb_ok:
+            print("") # Pindah baris
+            log(f"Triple Konfirmasi Valid! Harga termurah terdeteksi.", "BRAIN")
+            
+            sukses = eksekusi_beli_pasti()
+            
+            if sukses:
+                log(f"Bot akan istirahat {COOLDOWN/60} menit agar tidak over-trading...", "INFO")
+                time.sleep(COOLDOWN)
+    
+    time.sleep(SCAN_INTERVAL)
