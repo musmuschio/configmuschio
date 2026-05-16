@@ -1,8 +1,9 @@
 import os
-import ccxt
 import time
+import requests
 import pandas as pd
 import warnings
+import ccxt
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -17,7 +18,6 @@ API_KEY = os.getenv('API_KEY')
 SECRET_KEY = os.getenv('SECRET_KEY')
 
 SYMBOL_INDODAX = 'PEPE/IDR'     
-SYMBOL_RADAR = 'PEPE/USDT'      # Radar menggunakan MEXC
 BUY_AMOUNT_IDR = 14000          
 
 RSI_PERIOD = 14
@@ -31,11 +31,11 @@ def log(msg, level="INFO"):
     print(f"[{now}] {icons.get(level, '🔹')} {msg}")
 
 if not API_KEY or not SECRET_KEY:
-    log("KUNCI RAHASIA TIDAK DITEMUKAN! Pastikan file .env sudah dibuat dan diisi.", "ERROR")
+    log("KUNCI RAHASIA TIDAK DITEMUKAN! Pastikan file .env sudah diisi.", "ERROR")
     exit()
 
 # ==========================================
-# [2] INISIALISASI DUA MESIN 
+# [2] MESIN EKSEKUSI (INDODAX)
 # ==========================================
 indodax = ccxt.indodax({
     'apiKey': API_KEY,
@@ -43,19 +43,27 @@ indodax = ccxt.indodax({
     'enableRateLimit': True,
 })
 
-# Mata (Radar MEXC - Rajanya Memecoin, Bebas Blokir)
-mexc = ccxt.mexc({
-    'enableRateLimit': True,
-})
-
 # ==========================================
-# [3] RADAR MEXC (KHUSUS MEMECOIN)
+# [3] RADAR BINANCE VISION (ANTI-BLOKIR DNS)
 # ==========================================
-def analisa_market_via_mexc():
+def analisa_market_via_vision():
     try:
-        # Ambil 100 lilin terakhir (1 Menit)
-        bars = mexc.fetch_ohlcv(SYMBOL_RADAR, timeframe='1m', limit=100)
-        df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        # Langsung tembak ke server raw data Binance (Bebas Blokir Kominfo)
+        url = "https://data-api.binance.vision/api/v3/klines"
+        params = {
+            "symbol": "PEPEUSDT",
+            "interval": "1m",
+            "limit": 100
+        }
+        
+        response = requests.get(url, params=params, timeout=10)
+        data = response.json()
+        
+        # Susun data mentah menjadi tabel
+        df = pd.DataFrame(data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_vol', 'trades', 'taker_base', 'taker_quote', 'ignore'])
+        
+        # Pastikan format angka benar
+        df['close'] = df['close'].astype(float)
         
         # Hitung Indikator
         delta = df['close'].diff()
@@ -76,7 +84,7 @@ def analisa_market_via_mexc():
         
         return df
     except Exception as e:
-        log(f"Radar MEXC terhalang: {e}", "ERROR")
+        log(f"Jalur gorong-gorong Binance Vision terganggu: {e}", "ERROR")
         return None
 
 # ==========================================
@@ -115,7 +123,7 @@ def eksekusi_beli_pasti():
 # ==========================================
 # [5] MAIN LOOP (KANTOR PUSAT PEPE)
 # ==========================================
-log(f"--- AsTraDax Assault Unit (Radar MEXC) Aktif ---", "SUCCESS")
+log(f"--- AsTraDax Assault Unit (Binance Vision) Aktif ---", "SUCCESS")
 
 try:
     awal_balance = indodax.fetch_balance()
@@ -127,7 +135,7 @@ except Exception as e:
 
 while True:
     try:
-        df = analisa_market_via_mexc()
+        df = analisa_market_via_vision()
         
         if df is not None and not df.empty:
             curr = df.iloc[-1]
