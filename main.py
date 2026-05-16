@@ -1,75 +1,94 @@
 import ccxt
 import time
 import pandas as pd
+import cloudscraper
 from datetime import datetime
 
 # ==========================================
 # [1] KONFIGURASI UTAMA (THE SYNDICATE HQ)
 # ==========================================
-API_KEY = 'YOUR_API_KEY_INDODAX'
-SECRET_KEY = 'YOUR_SECRET_KEY_INDODAX'
+API_KEY = 'YOUR_API_KEY'
+SECRET_KEY = 'YOUR_SECRET_KEY'
 
-SYMBOL_INDODAX = 'BTC/IDR'     # Untuk eksekusi beli di Indodax
-SYMBOL_BINANCE = 'BTC/USDT'    # Untuk membaca grafik tanpa error
-BUY_AMOUNT_IDR = 25000         # Amunisi tembakan (Rupiah Bulat)
+SYMBOL_API = 'BTC/IDR'       # Untuk eksekusi beli CCXT
+SYMBOL_CHART = 'BTCIDR'      # Format khusus untuk Radar Indodax
+BUY_AMOUNT_IDR = 25000       # Amunisi (Rupiah Bulat)
 
-# Parameter Indikator
 RSI_PERIOD = 14
 RSI_OVERSOLD = 30
-SCAN_INTERVAL = 15       # Jeda antar cek pasar (detik)
-COOLDOWN = 600           # Jeda istirahat setelah berhasil beli (detik)
+SCAN_INTERVAL = 15       
+COOLDOWN = 600           
 
 # ==========================================
-# [2] INISIALISASI DUA MESIN & LOGGER
+# [2] INISIALISASI DUA MESIN (100% INDODAX)
 # ==========================================
-# Mesin 1: Indodax (Hanya untuk Eksekusi & Cek Uang)
+# Mesin Eksekusi (Tangan)
 indodax = ccxt.indodax({
     'apiKey': API_KEY,
     'secret': SECRET_KEY,
     'enableRateLimit': True,
 })
 
-# Mesin 2: Binance (Hanya untuk Radar Harga, GRATIS TANPA API KEY)
-binance = ccxt.binance({
-    'enableRateLimit': True,
-})
+# Mesin Radar Penyamar (Mata)
+scraper = cloudscraper.create_scraper()
 
 def log(msg, level="INFO"):
-    icons = {"INFO": "ℹ️", "SUCCESS": "✅", "WARN": "⚠️", "ERROR": "❌", "EXEC": "🚀", "BRAIN": "🧠", "MONEY": "💰", "RADAR": "📡"}
+    icons = {"INFO": "ℹ️", "SUCCESS": "✅", "WARN": "⚠️", "ERROR": "❌", "EXEC": "🚀", "BRAIN": "🧠", "MONEY": "💰"}
     now = datetime.now().strftime("%H:%M:%S")
     print(f"[{now}] {icons.get(level, '🔹')} {msg}")
 
 # ==========================================
-# [3] SISTEM KECERDASAN (RADAR BINANCE)
+# [3] RADAR GRAFIK (MENEMBUS CLOUDFLARE)
 # ==========================================
-def analisa_market_via_binance():
+def get_indodax_chart():
     try:
-        # PENTING: Kita ambil data lilin dari Binance agar TIDAK ERROR.
-        bars = binance.fetch_ohlcv(SYMBOL_BINANCE, timeframe='1m', limit=100)
-        df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        # Ambil waktu saat ini dan 100 menit ke belakang
+        to_ts = int(time.time())
+        from_ts = to_ts - (100 * 60)
         
-        # 1. Hitung RSI
-        delta = df['close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=RSI_PERIOD).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=RSI_PERIOD).mean()
-        rs = gain / loss
-        df['rsi'] = 100 - (100 / (1 + rs))
-
-        # 2. Hitung MACD (12, 26, 9)
-        exp1 = df['close'].ewm(span=12, adjust=False).mean()
-        exp2 = df['close'].ewm(span=26, adjust=False).mean()
-        df['macd'] = exp1 - exp2
-        df['macd_signal'] = df['macd'].ewm(span=9, adjust=False).mean()
-        df['macd_hist'] = df['macd'] - df['macd_signal']
-
-        # 3. Hitung Bollinger Bands (SMA 20)
-        df['bb_mid'] = df['close'].rolling(window=20).mean()
-        df['bb_std'] = df['close'].rolling(window=20).std()
-        df['bb_lower'] = df['bb_mid'] - (2 * df['bb_std'])
+        # Endpoint rahasia grafik Indodax
+        url = f"https://indodax.com/tradingview/history_v2?symbol={SYMBOL_CHART}&resolution=1&from={from_ts}&to={to_ts}"
         
-        return df
+        # Menyamar sebagai manusia menggunakan Cloudscraper
+        response = scraper.get(url).json()
+        
+        if response.get('s') == 'ok':
+            # Susun data mentah menjadi tabel (DataFrame)
+            df = pd.DataFrame({
+                'timestamp': response['t'],
+                'open': response['o'],
+                'high': response['h'],
+                'low': response['l'],
+                'close': response['c'],
+                'volume': response['v']
+            })
+            
+            # Hitung RSI
+            delta = df['close'].diff()
+            gain = (delta.where(delta > 0, 0)).rolling(window=RSI_PERIOD).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(window=RSI_PERIOD).mean()
+            rs = gain / loss
+            df['rsi'] = 100 - (100 / (1 + rs))
+
+            # Hitung MACD
+            exp1 = df['close'].ewm(span=12, adjust=False).mean()
+            exp2 = df['close'].ewm(span=26, adjust=False).mean()
+            df['macd'] = exp1 - exp2
+            df['macd_signal'] = df['macd'].ewm(span=9, adjust=False).mean()
+            df['macd_hist'] = df['macd'] - df['macd_signal']
+
+            # Hitung Bollinger Bands
+            df['bb_mid'] = df['close'].rolling(window=20).mean()
+            df['bb_std'] = df['close'].rolling(window=20).std()
+            df['bb_lower'] = df['bb_mid'] - (2 * df['bb_std'])
+            
+            return df
+        else:
+            log(f"Format data Indodax berubah: {response}", "WARN")
+            return None
+            
     except Exception as e:
-        log(f"Radar Binance terganggu: {e}", "ERROR")
+        log(f"Radar terhalang sistem keamanan: {e}", "ERROR")
         return None
 
 # ==========================================
@@ -77,73 +96,62 @@ def analisa_market_via_binance():
 # ==========================================
 def eksekusi_beli_pasti():
     try:
-        # LANGKAH 1: Cek Saldo Real-time di Indodax
-        log("Mengakses brankas Indodax untuk cek saldo...", "INFO")
+        log("Membuka brankas Indodax untuk verifikasi dana...", "INFO")
         balance = indodax.fetch_balance()
         idr_tersedia = balance.get('IDR', {}).get('free', 0)
         
-        log(f"Saldo IDR Anda saat ini: Rp {int(idr_tersedia):,}", "MONEY")
+        log(f"Dana Tersedia: Rp {int(idr_tersedia):,}", "MONEY")
         
-        # LANGKAH 2: Validasi Amunisi
         if idr_tersedia < BUY_AMOUNT_IDR:
-            log(f"Amunisi kurang! Bot butuh Rp {BUY_AMOUNT_IDR}, tapi saldo cuma Rp {int(idr_tersedia)}.", "WARN")
+            log(f"Operasi dibatalkan! Dana tidak cukup (Min: Rp {BUY_AMOUNT_IDR}).", "WARN")
             return False
             
-        # LANGKAH 3: Tembak Langsung di Indodax
-        log(f"Mengeksekusi BELI {SYMBOL_INDODAX} senilai Rp {BUY_AMOUNT_IDR}...", "EXEC")
+        log(f"Mengeksekusi BELI {SYMBOL_API} senilai Rp {BUY_AMOUNT_IDR}...", "EXEC")
         
         order = indodax.private_post_trade({
-            'pair': SYMBOL_INDODAX.replace('/', '_').lower(),
+            'pair': SYMBOL_API.replace('/', '_').lower(),
             'type': 'buy',
             'idr': int(BUY_AMOUNT_IDR)
         })
         
-        # LANGKAH 4: Konfirmasi Sukses
         if order.get('success') == 1 or order.get('success') == '1':
-            detail = order.get('return', {})
-            terima = detail.get('receive_btc', 'koin')
-            log(f"TRANSAKSI SUKSES! Saldo Rp{BUY_AMOUNT_IDR} telah ditukar menjadi {terima} {SYMBOL_INDODAX}.", "SUCCESS")
+            terima = order.get('return', {}).get('receive_btc', 'koin')
+            log(f"EKSEKUSI BERHASIL! Mendapatkan {terima} {SYMBOL_API}.", "SUCCESS")
             return True
         else:
-            pesan_error = order.get('error', 'Unknown Error')
-            log(f"Transaksi Ditolak Server Indodax: {pesan_error}", "ERROR")
+            log(f"Eksekusi digagalkan server: {order.get('error', 'Error')}", "ERROR")
             return False
 
     except Exception as e:
-        log(f"Koneksi Eksekusi Terputus: {e}", "ERROR")
+        log(f"Jalur eksekusi terputus: {e}", "ERROR")
         return False
 
 # ==========================================
-# [5] MAIN LOOP (KANTOR PUSAT)
+# [5] KANTOR PUSAT OPERASIONAL
 # ==========================================
-log(f"--- AsTraDax Absolute Final Aktif ---", "SUCCESS")
-log(f"Radar: {SYMBOL_BINANCE} (Binance) | Eksekusi: {SYMBOL_INDODAX} (Indodax)", "RADAR")
-log(f"Amunisi: Rp {BUY_AMOUNT_IDR} | Indikator: RSI, MACD, BB", "INFO")
+log(f"--- AsTraDax V3 (Pure Indodax Engine) Aktif ---", "SUCCESS")
+log(f"Sistem bekerja mandiri tanpa koneksi pihak ketiga.", "INFO")
 
 while True:
-    df = analisa_market_via_binance()
+    df = get_indodax_chart()
     
-    if df is not None:
+    if df is not None and not df.empty:
         curr = df.iloc[-1]
         
-        # Evaluasi Kecerdasan
         rsi_ok = curr['rsi'] <= RSI_OVERSOLD
         macd_ok = curr['macd_hist'] > 0  
         bb_ok = curr['close'] <= curr['bb_lower'] 
         
-        # Tampilkan status ke layar (Harga dalam USDT karena baca dari Binance)
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] 🧐 Harga Global(USDT): ${curr['close']:.2f} | RSI:{curr['rsi']:.1f} | BB_Low:${curr['bb_lower']:.0f} | MACD:{curr['macd_hist']:.1f}", end='\r')
+        # Tampilan terminal yang rapi
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] 🧐 Harga: Rp{curr['close']:,.0f} | RSI:{curr['rsi']:.1f} | BB_Low: Rp{curr['bb_lower']:,.0f} | MACD:{curr['macd_hist']:.0f}      ", end='\r')
         
         if rsi_ok and macd_ok and bb_ok:
             print("") 
-            log(f"Triple Konfirmasi Valid! Pasar global sedang diskon besar.", "BRAIN")
+            log("Sinyal Triple Konfirmasi Menyala! Memulai operasi pembelian...", "BRAIN")
             
-            sukses = eksekusi_beli_pasti()
-            
-            if sukses:
-                log(f"Bot istirahat {COOLDOWN/60} menit...", "INFO")
+            if eksekusi_beli_pasti():
+                log(f"Sistem pendingin aktif selama {COOLDOWN/60} menit.", "INFO")
                 time.sleep(COOLDOWN)
     
     time.sleep(SCAN_INTERVAL)
-
-
+        
