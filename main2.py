@@ -17,8 +17,8 @@ API_KEY = os.getenv('API_KEY')
 SECRET_KEY = os.getenv('SECRET_KEY')
 
 SYMBOL_INDODAX = 'PEPE/IDR'     
-SYMBOL_RADAR = 'PEPE/USDT'      # Radar menggunakan KuCoin
-BUY_AMOUNT_IDR = 14000          # Amunisi Rp 14.000
+SYMBOL_RADAR = 'PEPE/USDT'      # Radar menggunakan MEXC
+BUY_AMOUNT_IDR = 14000          
 
 RSI_PERIOD = 14
 RSI_OVERSOLD = 30
@@ -37,25 +37,24 @@ if not API_KEY or not SECRET_KEY:
 # ==========================================
 # [2] INISIALISASI DUA MESIN 
 # ==========================================
-# Tangan (Eksekusi Indodax)
 indodax = ccxt.indodax({
     'apiKey': API_KEY,
     'secret': SECRET_KEY,
     'enableRateLimit': True,
 })
 
-# Mata (Radar KuCoin - Anti Blokir)
-kucoin = ccxt.kucoin({
+# Mata (Radar MEXC - Rajanya Memecoin, Bebas Blokir)
+mexc = ccxt.mexc({
     'enableRateLimit': True,
 })
 
 # ==========================================
-# [3] RADAR KUCOIN (KHUSUS MEMECOIN)
+# [3] RADAR MEXC (KHUSUS MEMECOIN)
 # ==========================================
-def analisa_market_via_kucoin():
+def analisa_market_via_mexc():
     try:
         # Ambil 100 lilin terakhir (1 Menit)
-        bars = kucoin.fetch_ohlcv(SYMBOL_RADAR, timeframe='1m', limit=100)
+        bars = mexc.fetch_ohlcv(SYMBOL_RADAR, timeframe='1m', limit=100)
         df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         
         # Hitung Indikator
@@ -77,7 +76,7 @@ def analisa_market_via_kucoin():
         
         return df
     except Exception as e:
-        log(f"Radar KuCoin terhalang: {e}", "ERROR")
+        log(f"Radar MEXC terhalang: {e}", "ERROR")
         return None
 
 # ==========================================
@@ -116,7 +115,7 @@ def eksekusi_beli_pasti():
 # ==========================================
 # [5] MAIN LOOP (KANTOR PUSAT PEPE)
 # ==========================================
-log(f"--- AsTraDax Assault Unit (Radar KuCoin) Aktif ---", "SUCCESS")
+log(f"--- AsTraDax Assault Unit (Radar MEXC) Aktif ---", "SUCCESS")
 
 try:
     awal_balance = indodax.fetch_balance()
@@ -128,7 +127,7 @@ except Exception as e:
 
 while True:
     try:
-        df = analisa_market_via_kucoin()
+        df = analisa_market_via_mexc()
         
         if df is not None and not df.empty:
             curr = df.iloc[-1]
@@ -137,7 +136,6 @@ while True:
             macd_ok = curr['macd_hist'] > 0  
             bb_ok = curr['close'] <= curr['bb_lower'] 
             
-            # Format desimal diperpanjang agar harga PEPE terlihat jelas
             harga_usd = float(curr['close'])
             rsi_val = float(curr['rsi'])
             bb_low_val = float(curr['bb_lower'])
@@ -157,4 +155,4 @@ while True:
         log(f"Main Loop Error: {e}", "ERROR")
         
     time.sleep(SCAN_INTERVAL)
-            
+        
