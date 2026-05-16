@@ -33,7 +33,6 @@ def log(msg, level="INFO"):
     now = datetime.now().strftime("%H:%M:%S")
     print(f"[{now}] {icons.get(level, '🔹')} {msg}")
 
-# Pengecekan Keamanan Kunci API
 if not API_KEY or not SECRET_KEY:
     log("KUNCI RAHASIA TIDAK DITEMUKAN! Pastikan file .env sudah dibuat dan diisi.", "ERROR")
     exit()
@@ -48,20 +47,23 @@ indodax = ccxt.indodax({
 })
 
 # ==========================================
-# [3] RADAR YAHOO FINANCE
+# [3] RADAR YAHOO FINANCE (DIHANCURKAN & DIBANGUN ULANG)
 # ==========================================
 def analisa_market_via_yahoo():
     try:
-        df = yf.download(tickers=SYMBOL_YAHOO, period='5d', interval='1m', progress=False)
+        raw = yf.download(tickers=SYMBOL_YAHOO, period='5d', interval='1m', progress=False)
         
-        if df.empty:
+        if raw.empty:
             return None
             
-        # Memaksa format data MultiIndex Yahoo menjadi angka tunggal (1D Array)
-        df['close'] = df['Close'].values.flatten()
-        df['low'] = df['Low'].values.flatten()
+        # PERBAIKAN MUTLAK FATAL: Membuang semua format Yahoo dan membuat tabel Pandas murni
+        # Menggunakan .values.flatten() untuk memastikan ini adalah array 1 Dimensi biasa
+        df = pd.DataFrame({
+            'close': raw['Close'].values.flatten(),
+            'low': raw['Low'].values.flatten()
+        })
         
-        # Hitung Indikator
+        # Hitung Indikator (Sekarang pasti aman karena tabelnya sudah bersih)
         delta = df['close'].diff()
         gain = (delta.where(delta > 0, 0)).rolling(window=RSI_PERIOD).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(window=RSI_PERIOD).mean()
@@ -142,6 +144,7 @@ while True:
             macd_ok = curr['macd_hist'] > 0  
             bb_ok = curr['close'] <= curr['bb_lower'] 
             
+            # Sekarang ini 100% pasti angka mutlak (float), bukan Series lagi
             harga_usd = float(curr['close'])
             rsi_val = float(curr['rsi'])
             bb_low_val = float(curr['bb_lower'])
@@ -161,4 +164,3 @@ while True:
         log(f"Main Loop Error: {e}", "ERROR")
         
     time.sleep(SCAN_INTERVAL)
-    
