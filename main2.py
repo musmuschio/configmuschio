@@ -1,166 +1,293 @@
 import os
+import sys
 import time
+import sqlite3
+import logging
 import requests
 import pandas as pd
-import warnings
 import ccxt
+import warnings
+import threading
+import shutil
 from datetime import datetime
+from logging.handlers import RotatingFileHandler
 from dotenv import load_dotenv
 
-# Matikan peringatan
 warnings.filterwarnings('ignore')
 load_dotenv()
 
 # ==========================================
-# [1] KONFIGURASI UTAMA (THE SYNDICATE HQ)
+# [1] KONFIGURASI PRODUKSI (UNIT PEPE)
 # ==========================================
-API_KEY = os.getenv('API_KEY')
-SECRET_KEY = os.getenv('SECRET_KEY')
+API_KEY = os.getenv("API_KEY")
+SECRET_KEY = os.getenv("SECRET_KEY")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-SYMBOL_INDODAX = 'PEPE/IDR'     
-BUY_AMOUNT_IDR = 14000          
+SYMBOL = "PEPE/IDR"
+SYMBOL_RADAR = "PEPEUSDT"
+COIN_NAME = "PEPE"
 
-RSI_PERIOD = 14
-RSI_OVERSOLD = 30
-SCAN_INTERVAL = 15       
-COOLDOWN = 600           
+# --- IDENTITAS UNIK (AGAR TIDAK BENTROK DENGAN BTC) ---
+PID_FILE = "pepe_bot.pid"
+DB_NAME = "pepe_state.db"
+DB_BACKUP = "pepe_state_backup.db"
+LOG_FILE = "pepe_trading.log"
+KILL_SWITCH_FILE = "stop_pepe.flag"
 
-def log(msg, level="INFO"):
-    icons = {"INFO": "ℹ️", "SUCCESS": "✅", "WARN": "⚠️", "ERROR": "❌", "EXEC": "🚀", "BRAIN": "🧠", "MONEY": "💰", "RADAR": "📡"}
-    now = datetime.now().strftime("%H:%M:%S")
-    print(f"[{now}] {icons.get(level, '🔹')} {msg}")
-
-if not API_KEY or not SECRET_KEY:
-    log("KUNCI RAHASIA TIDAK DITEMUKAN! Pastikan file .env sudah diisi.", "ERROR")
-    exit()
-
-# ==========================================
-# [2] MESIN EKSEKUSI (INDODAX)
-# ==========================================
-indodax = ccxt.indodax({
-    'apiKey': API_KEY,
-    'secret': SECRET_KEY,
-    'enableRateLimit': True,
-})
+# --- PARAMETER EKSEKUSI ---
+MIN_ORDER_IDR = 10000
+TRADING_FEE_PCT = 0.3      
+TAKE_PROFIT_1_PCT = 2.0    
+TAKE_PROFIT_2_PCT = 5.0    
+STOP_LOSS_PCT = 1.0        
+TRAILING_STOP_PCT = 0.5    
+MAX_DAILY_LOSS_IDR = 25000 
+COOLDOWN_MINUTES = 15      
 
 # ==========================================
-# [3] RADAR BINANCE VISION (ANTI-BLOKIR DNS)
+# [2] SINGLE INSTANCE PROTECTION (PID LOCK)
 # ==========================================
-def analisa_market_via_vision():
-    try:
-        # Langsung tembak ke server raw data Binance (Bebas Blokir Kominfo)
-        url = "https://data-api.binance.vision/api/v3/klines"
-        params = {
-            "symbol": "PEPEUSDT",
-            "interval": "1m",
-            "limit": 100
-        }
-        
-        response = requests.get(url, params=params, timeout=10)
-        data = response.json()
-        
-        # Susun data mentah menjadi tabel
-        df = pd.DataFrame(data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_vol', 'trades', 'taker_base', 'taker_quote', 'ignore'])
-        
-        # Pastikan format angka benar
-        df['close'] = df['close'].astype(float)
-        
-        # Hitung Indikator
-        delta = df['close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=RSI_PERIOD).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=RSI_PERIOD).mean()
-        rs = gain / loss
-        df['rsi'] = 100 - (100 / (1 + rs))
+def check_single_instance():
+    """Mencegah dua bot PEPE berjalan bersamaan"""
+    if os.path.exists(PID_FILE):
+        try:
+            with open(PID_FILE, 'r') as f:
+                pid = int(f.read())
+            # Cek apakah proses dengan PID ini masih hidup
+            os.kill(pid, 0)
+            print(f"❌ ERROR: Bot PEPE sudah jalan (PID: {pid}).")
+            sys.exit(1)
+        except (ProcessLookupError, ValueError, OSError):
+            # Jika file ada tapi proses sudah mati, hapus file lama
+            os.remove(PID_FILE)
+            
+    with open(PID_FILE, 'w') as f:
+        f.write(str(os.getpid()))
 
-        exp1 = df['close'].ewm(span=12, adjust=False).mean()
-        exp2 = df['close'].ewm(span=26, adjust=False).mean()
-        df['macd'] = exp1 - exp2
-        df['macd_signal'] = df['macd'].ewm(span=9, adjust=False).mean()
-        df['macd_hist'] = df['macd'] - df['macd_signal']
+check_single_instance()
 
-        df['bb_mid'] = df['close'].rolling(window=20).mean()
-        df['bb_std'] = df['close'].rolling(window=20).std()
-        df['bb_lower'] = df['bb_mid'] - (2 * df['bb_std'])
-        
-        return df
-    except Exception as e:
-        log(f"Jalur gorong-gorong Binance Vision terganggu: {e}", "ERROR")
+# ==========================================
+# [3] LOGGING & ASYNC TELEGRAM
+# ==========================================
+def setup_logger():
+    logger = logging.getLogger("PepeBot")
+    if logger.handlers: return logger
+    logger.setLevel(logging.DEBUG)
+    fmt = logging.Formatter('[%(asctime)s] %(levelname)s: %(message)s', datefmt='%H:%M:%S')
+    
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+    ch.setFormatter(fmt)
+    
+    fh = RotatingFileHandler(LOG_FILE, maxBytes=5*1024*1024, backupCount=3)
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(fmt)
+    
+    logger.addHandler(ch)
+    logger.addHandler(fh)
+    return logger
+
+log = setup_logger()
+
+def send_telegram(message: str):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: return
+    def _send():
+        try:
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+            requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}, timeout=5)
+        except Exception: pass
+    threading.Thread(target=_send, daemon=True).start()
+
+# ==========================================
+# [4] DATABASE SQLITE (WAL MODE)
+# ==========================================
+class Database:
+    def __init__(self):
+        self.conn = sqlite3.connect(DB_NAME, timeout=30, check_same_thread=False)
+        self.cursor = self.conn.cursor()
+        self.cursor.execute("PRAGMA journal_mode=WAL;") 
+        self._create_tables()
+
+    def _create_tables(self):
+        self.cursor.execute('''CREATE TABLE IF NOT EXISTS positions 
+            (id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT, buy_price REAL, 
+            amount_koin REAL, amount_idr REAL, highest_price REAL, status TEXT, buy_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+        self.cursor.execute('''CREATE TABLE IF NOT EXISTS trade_history 
+            (id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT, side TEXT, price REAL, 
+            amount_idr REAL, pnl_pct REAL, pnl_idr REAL, reason TEXT, timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+        self.conn.commit()
+
+    def backup(self):
+        try: shutil.copy(DB_NAME, DB_BACKUP)
+        except Exception: pass
+
+    def save_position(self, symbol, buy_price, amount_koin, amount_idr):
+        self.cursor.execute("INSERT INTO positions (symbol, buy_price, amount_koin, amount_idr, highest_price, status) VALUES (?, ?, ?, ?, ?, 'OPEN')",
+            (symbol, buy_price, amount_koin, amount_idr, buy_price))
+        self.conn.commit()
+        self.backup()
+
+    def get_active_position(self, symbol):
+        self.cursor.execute("SELECT * FROM positions WHERE symbol = ? AND status = 'OPEN'", (symbol,))
+        row = self.cursor.fetchone()
+        if row: return {"id": row[0], "symbol": row[1], "buy_price": row[2], "amount_koin": row[3], "amount_idr": row[4], "highest_price": row[5]}
         return None
 
-# ==========================================
-# [4] AUDIT SALDO & EKSEKUSI INDODAX
-# ==========================================
-def eksekusi_beli_pasti():
-    try:
-        balance = indodax.fetch_balance()
-        idr_tersedia = balance.get('IDR', {}).get('free', 0)
-        
-        log(f"Audit Saldo IDR: Rp {int(idr_tersedia):,}", "MONEY")
-        
-        if idr_tersedia < BUY_AMOUNT_IDR:
-            log(f"Amunisi kurang! Butuh Rp {BUY_AMOUNT_IDR}, saldo cuma Rp {int(idr_tersedia)}.", "WARN")
-            return False
-            
-        log(f"Mengeksekusi BELI {SYMBOL_INDODAX} senilai Rp {BUY_AMOUNT_IDR}...", "EXEC")
-        
-        order = indodax.private_post_trade({
-            'pair': SYMBOL_INDODAX.replace('/', '_').lower(),
-            'type': 'buy',
-            'idr': int(BUY_AMOUNT_IDR)
-        })
-        
-        if order.get('success') == 1 or order.get('success') == '1':
-            log(f"TRANSAKSI SUKSES! Pasukan PEPE berhasil diamankan senilai Rp{BUY_AMOUNT_IDR}.", "SUCCESS")
-            return True
-        else:
-            log(f"Ditolak Indodax: {order.get('error', 'Unknown Error')}", "ERROR")
-            return False
+    def update_highest_price(self, pos_id, new_high):
+        self.cursor.execute("UPDATE positions SET highest_price = ? WHERE id = ?", (new_high, pos_id))
+        self.conn.commit()
 
-    except Exception as e:
-        log(f"Koneksi Eksekusi Terputus: {e}", "ERROR")
-        return False
+    def close_position(self, pos_id, symbol, sell_price, amount_idr, pnl_pct, pnl_idr, reason):
+        self.cursor.execute("UPDATE positions SET status = 'CLOSED' WHERE id = ?", (pos_id,))
+        self.cursor.execute("INSERT INTO trade_history (symbol, side, price, amount_idr, pnl_pct, pnl_idr, reason) VALUES (?, 'SELL', ?, ?, ?, ?, ?)",
+            (symbol, sell_price, amount_idr, pnl_pct, pnl_idr, reason))
+        self.conn.commit()
+        self.backup()
+
+    def get_daily_loss_idr(self):
+        today = datetime.now().strftime('%Y-%m-%d')
+        self.cursor.execute("SELECT SUM(pnl_idr) FROM trade_history WHERE side = 'SELL' AND pnl_idr < 0 AND date(timestamp) = ?", (today,))
+        total = self.cursor.fetchone()[0]
+        return abs(total) if total else 0.0
 
 # ==========================================
-# [5] MAIN LOOP (KANTOR PUSAT PEPE)
+# [5] EXCHANGE & RADAR
 # ==========================================
-log(f"--- AsTraDax Assault Unit (Binance Vision) Aktif ---", "SUCCESS")
+class ExchangeManager:
+    def __init__(self):
+        self.api = ccxt.indodax({'apiKey': API_KEY, 'secret': SECRET_KEY, 'enableRateLimit': True})
 
-try:
-    awal_balance = indodax.fetch_balance()
-    idr_awal = awal_balance.get('IDR', {}).get('free', 0)
-    log(f"Koneksi API Aman! Saldo awal kamu: Rp {int(idr_awal):,}", "MONEY")
-except Exception as e:
-    log(f"Gagal verifikasi kunci API. Error: {e}", "ERROR")
-    exit()
+    def fetch_market_data(self, symbol):
+        try:
+            url = "https://data-api.binance.vision/api/v3/klines"
+            res = requests.get(url, params={"symbol": symbol, "interval": "1m", "limit": 100}, timeout=5).json()
+            df = pd.DataFrame(res, columns=['t', 'open', 'high', 'low', 'close', 'v', 'ct', 'qv', 'tr', 'tb', 'tq', 'ig'])
+            df['close'] = df['close'].astype(float)
+            df['volume'] = df['volume'].astype(float)
+            return df
+        except Exception: return None
 
-while True:
-    try:
-        df = analisa_market_via_vision()
+    def get_indodax_ticker(self, symbol):
+        try:
+            return self.api.fetch_ticker(symbol)['last']
+        except Exception: return None
+
+    def get_balance(self, asset):
+        try:
+            bal = self.api.fetch_balance()
+            return float(bal.get(asset, {}).get('free', 0))
+        except Exception: return 0.0
+
+    def execute_buy_verified(self, symbol, amount_idr):
+        coin = symbol.split('/')[0]
+        bal_before = self.get_balance(coin)
+        order = self.api.private_post_trade({'pair': symbol.replace('/', '_').lower(), 'type': 'buy', 'idr': int(amount_idr)})
+        if order and str(order.get('success')) == '1':
+            time.sleep(3)
+            real_received = self.get_balance(coin) - bal_before
+            if real_received > 0:
+                return {"success": True, "koin_diterima": real_received, "real_price": amount_idr / real_received}
+        return {"success": False}
+
+    def execute_sell_verified(self, symbol, amount_koin):
+        actual_bal = self.get_balance(symbol.split('/')[0])
+        sell_amount = min(amount_koin, actual_bal)
+        if sell_amount <= 0: return False
+        order = self.api.private_post_trade({'pair': symbol.replace('/', '_').lower(), 'type': 'sell', symbol.split('/')[0].lower(): sell_amount})
+        return True if order and str(order.get('success')) == '1' else False
+
+# ==========================================
+# [6] STRATEGY & RISK ENGINE
+# ==========================================
+class StrategyEngine:
+    @staticmethod
+    def calculate_score(df):
+        if df is None or len(df) < 20: return 0
+        close = df['close']
+        delta = close.diff()
+        gain = (delta.where(delta > 0, 0)).ewm(alpha=1/14, adjust=False).mean()
+        loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/14, adjust=False).mean()
+        rsi = 100 - (100 / (1 + (gain / loss)))
         
-        if df is not None and not df.empty:
-            curr = df.iloc[-1]
-            
-            rsi_ok = curr['rsi'] <= RSI_OVERSOLD
-            macd_ok = curr['macd_hist'] > 0  
-            bb_ok = curr['close'] <= curr['bb_lower'] 
-            
-            harga_usd = float(curr['close'])
-            rsi_val = float(curr['rsi'])
-            bb_low_val = float(curr['bb_lower'])
-            macd_val = float(curr['macd_hist'])
-            
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] 🧐 Harga(USDT): ${harga_usd:.8f} | RSI:{rsi_val:.1f} | BB_Low:${bb_low_val:.8f} | MACD:{macd_val:.8f}      ", end='\r')
-            
-            if rsi_ok and macd_ok and bb_ok:
-                print("") 
-                log(f"Sinyal Valid Ditemukan! Katak Hijau Diskon, Menginisiasi pembelian...", "BRAIN")
+        # Gunakan candle yang SUDAH TUTUP (iloc[-2])
+        curr_rsi = rsi.iloc[-2]
+        score = 0
+        if curr_rsi < 30: score += 40
+        if close.iloc[-2] <= close.rolling(20).mean().iloc[-2]: score += 30
+        return score
+
+# ==========================================
+# [7] CORE LOOP
+# ==========================================
+class TradingBot:
+    def __init__(self):
+        self.db = Database()
+        self.ex = ExchangeManager()
+        self.engine = StrategyEngine()
+        self.last_loop = time.time()
+
+    def run(self):
+        log.info(f"Unit PEPE Aktif. PID: {os.getpid()}")
+        send_telegram(f"🐸 <b>PEPE UNIT DEPLOYED</b>\nPair: {SYMBOL}\nStatus: Monitoring")
+
+        while True:
+            try:
+                # Watchdog
+                self.last_loop = time.time()
                 
-                if eksekusi_beli_pasti():
-                    log(f"Bot istirahat sejenak selama {COOLDOWN/60} menit...", "INFO")
-                    time.sleep(COOLDOWN)
-        
-    except Exception as e:
-        log(f"Main Loop Error: {e}", "ERROR")
-        
-    time.sleep(SCAN_INTERVAL)
-        
+                # Check Kill Switch
+                if os.path.exists(KILL_SWITCH_FILE):
+                    time.sleep(15); continue
+
+                idx_price = self.ex.get_indodax_ticker(SYMBOL)
+                pos = self.db.get_active_position(SYMBOL)
+                
+                if pos:
+                    gross = ((idx_price - pos['buy_price']) / pos['buy_price']) * 100
+                    net = gross - (TRADING_FEE_PCT * 2)
+                    
+                    if idx_price > pos['highest_price']: self.db.update_highest_price(pos['id'], idx_price)
+                    
+                    reason = None
+                    drop = ((pos['highest_price'] - idx_price) / pos['highest_price']) * 100
+                    
+                    if net >= TAKE_PROFIT_2_PCT: reason = "HARD EXIT"
+                    elif net >= TAKE_PROFIT_1_PCT and drop >= TRAILING_STOP_PCT: reason = "TRAILING"
+                    elif net <= -STOP_LOSS_PCT: reason = "STOP LOSS"
+
+                    sys.stdout.write(f"\r[{datetime.now().strftime('%H:%M:%S')}] PEPE HOLD | PnL: {net:.2f}%   ")
+                    sys.stdout.flush()
+
+                    if reason:
+                        if self.ex.execute_sell_verified(SYMBOL, pos['amount_koin']):
+                            self.db.close_position(pos['id'], SYMBOL, idx_price, pos['amount_idr'], net, (pos['amount_idr']*net/100), reason)
+                            send_telegram(f"🟢 <b>PEPE SOLD ({reason})</b>\nPnL: {net:.2f}%")
+                            time.sleep(COOLDOWN_MINUTES * 60)
+                else:
+                    df = self.ex.fetch_market_data(SYMBOL_RADAR)
+                    score = self.engine.calculate_score(df)
+                    sys.stdout.write(f"\r[{datetime.now().strftime('%H:%M:%S')}] PEPE SCAN | Score: {score}/100   ")
+                    sys.stdout.flush()
+
+                    if score >= 70:
+                        bal = self.ex.get_balance('IDR')
+                        if bal >= MIN_ORDER_IDR:
+                            res = self.ex.execute_buy_verified(SYMBOL, 14000)
+                            if res['success']:
+                                self.db.save_position(SYMBOL, res['real_price'], res['koin_diterima'], 14000)
+                                send_telegram(f"🔵 <b>PEPE BOUGHT</b>\nPrice: Rp{res['real_price']:.8f}")
+                                time.sleep(COOLDOWN_MINUTES * 60)
+
+            except Exception as e:
+                log.error(f"Error: {e}"); time.sleep(10)
+            time.sleep(15)
+
+if __name__ == "__main__":
+    try:
+        bot = TradingBot()
+        bot.run()
+    except KeyboardInterrupt:
+        if os.path.exists(PID_FILE): os.remove(PID_FILE)
+        sys.exit(0)
+    
