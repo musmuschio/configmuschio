@@ -1,8 +1,12 @@
 import ccxt
 import time
 import pandas as pd
-import cloudscraper
+import yfinance as yf
+import warnings
 from datetime import datetime
+
+# Matikan pesan peringatan yang tidak penting dari library
+warnings.filterwarnings('ignore')
 
 # ==========================================
 # [1] KONFIGURASI UTAMA (THE SYNDICATE HQ)
@@ -10,9 +14,9 @@ from datetime import datetime
 API_KEY = 'YOUR_API_KEY'
 SECRET_KEY = 'YOUR_SECRET_KEY'
 
-SYMBOL_API = 'BTC/IDR'       # Untuk eksekusi beli CCXT
-SYMBOL_CHART = 'BTCIDR'      # Format khusus untuk Radar Indodax
-BUY_AMOUNT_IDR = 25000       # Amunisi (Rupiah Bulat)
+SYMBOL_INDODAX = 'BTC/IDR'     # Eksekusi Rupiah
+SYMBOL_YAHOO = 'BTC-USD'       # Radar Harga (Dolar)
+BUY_AMOUNT_IDR = 25000         # Amunisi tembakan
 
 RSI_PERIOD = 14
 RSI_OVERSOLD = 30
@@ -20,17 +24,13 @@ SCAN_INTERVAL = 15
 COOLDOWN = 600           
 
 # ==========================================
-# [2] INISIALISASI DUA MESIN (100% INDODAX)
+# [2] INISIALISASI MESIN EKSEKUSI INDODAX
 # ==========================================
-# Mesin Eksekusi (Tangan)
 indodax = ccxt.indodax({
     'apiKey': API_KEY,
     'secret': SECRET_KEY,
     'enableRateLimit': True,
 })
-
-# Mesin Radar Penyamar (Mata)
-scraper = cloudscraper.create_scraper()
 
 def log(msg, level="INFO"):
     icons = {"INFO": "ℹ️", "SUCCESS": "✅", "WARN": "⚠️", "ERROR": "❌", "EXEC": "🚀", "BRAIN": "🧠", "MONEY": "💰"}
@@ -38,57 +38,42 @@ def log(msg, level="INFO"):
     print(f"[{now}] {icons.get(level, '🔹')} {msg}")
 
 # ==========================================
-# [3] RADAR GRAFIK (MENEMBUS CLOUDFLARE)
+# [3] RADAR YAHOO FINANCE (ANTI-BLOKIR)
 # ==========================================
-def get_indodax_chart():
+def analisa_market_via_yahoo():
     try:
-        # Ambil waktu saat ini dan 100 menit ke belakang
-        to_ts = int(time.time())
-        from_ts = to_ts - (100 * 60)
+        # Mengambil data 1 menit dari Yahoo Finance
+        df = yf.download(tickers=SYMBOL_YAHOO, period='5d', interval='1m', progress=False)
         
-        # Endpoint rahasia grafik Indodax
-        url = f"https://indodax.com/tradingview/history_v2?symbol={SYMBOL_CHART}&resolution=1&from={from_ts}&to={to_ts}"
-        
-        # Menyamar sebagai manusia menggunakan Cloudscraper
-        response = scraper.get(url).json()
-        
-        if response.get('s') == 'ok':
-            # Susun data mentah menjadi tabel (DataFrame)
-            df = pd.DataFrame({
-                'timestamp': response['t'],
-                'open': response['o'],
-                'high': response['h'],
-                'low': response['l'],
-                'close': response['c'],
-                'volume': response['v']
-            })
-            
-            # Hitung RSI
-            delta = df['close'].diff()
-            gain = (delta.where(delta > 0, 0)).rolling(window=RSI_PERIOD).mean()
-            loss = (-delta.where(delta < 0, 0)).rolling(window=RSI_PERIOD).mean()
-            rs = gain / loss
-            df['rsi'] = 100 - (100 / (1 + rs))
-
-            # Hitung MACD
-            exp1 = df['close'].ewm(span=12, adjust=False).mean()
-            exp2 = df['close'].ewm(span=26, adjust=False).mean()
-            df['macd'] = exp1 - exp2
-            df['macd_signal'] = df['macd'].ewm(span=9, adjust=False).mean()
-            df['macd_hist'] = df['macd'] - df['macd_signal']
-
-            # Hitung Bollinger Bands
-            df['bb_mid'] = df['close'].rolling(window=20).mean()
-            df['bb_std'] = df['close'].rolling(window=20).std()
-            df['bb_lower'] = df['bb_mid'] - (2 * df['bb_std'])
-            
-            return df
-        else:
-            log(f"Format data Indodax berubah: {response}", "WARN")
+        if df.empty:
             return None
             
+        # Menyesuaikan nama kolom Yahoo untuk rumus kita
+        df['close'] = df['Close']
+        df['low'] = df['Low']
+        
+        # Hitung RSI
+        delta = df['close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=RSI_PERIOD).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=RSI_PERIOD).mean()
+        rs = gain / loss
+        df['rsi'] = 100 - (100 / (1 + rs))
+
+        # Hitung MACD
+        exp1 = df['close'].ewm(span=12, adjust=False).mean()
+        exp2 = df['close'].ewm(span=26, adjust=False).mean()
+        df['macd'] = exp1 - exp2
+        df['macd_signal'] = df['macd'].ewm(span=9, adjust=False).mean()
+        df['macd_hist'] = df['macd'] - df['macd_signal']
+
+        # Hitung Bollinger Bands
+        df['bb_mid'] = df['close'].rolling(window=20).mean()
+        df['bb_std'] = df['close'].rolling(window=20).std()
+        df['bb_lower'] = df['bb_mid'] - (2 * df['bb_std'])
+        
+        return df
     except Exception as e:
-        log(f"Radar terhalang sistem keamanan: {e}", "ERROR")
+        log(f"Gangguan sinyal Yahoo: {e}", "ERROR")
         return None
 
 # ==========================================
@@ -96,44 +81,50 @@ def get_indodax_chart():
 # ==========================================
 def eksekusi_beli_pasti():
     try:
-        log("Membuka brankas Indodax untuk verifikasi dana...", "INFO")
         balance = indodax.fetch_balance()
         idr_tersedia = balance.get('IDR', {}).get('free', 0)
         
-        log(f"Dana Tersedia: Rp {int(idr_tersedia):,}", "MONEY")
+        log(f"Audit Saldo IDR: Rp {int(idr_tersedia):,}", "MONEY")
         
         if idr_tersedia < BUY_AMOUNT_IDR:
-            log(f"Operasi dibatalkan! Dana tidak cukup (Min: Rp {BUY_AMOUNT_IDR}).", "WARN")
+            log(f"Amunisi kurang! Bot butuh Rp {BUY_AMOUNT_IDR}, saldo cuma Rp {int(idr_tersedia)}.", "WARN")
             return False
             
-        log(f"Mengeksekusi BELI {SYMBOL_API} senilai Rp {BUY_AMOUNT_IDR}...", "EXEC")
+        log(f"Mengeksekusi BELI {SYMBOL_INDODAX} senilai Rp {BUY_AMOUNT_IDR}...", "EXEC")
         
         order = indodax.private_post_trade({
-            'pair': SYMBOL_API.replace('/', '_').lower(),
+            'pair': SYMBOL_INDODAX.replace('/', '_').lower(),
             'type': 'buy',
             'idr': int(BUY_AMOUNT_IDR)
         })
         
         if order.get('success') == 1 or order.get('success') == '1':
             terima = order.get('return', {}).get('receive_btc', 'koin')
-            log(f"EKSEKUSI BERHASIL! Mendapatkan {terima} {SYMBOL_API}.", "SUCCESS")
+            log(f"TRANSAKSI SUKSES! Saldo Rp{BUY_AMOUNT_IDR} telah menjadi {terima} {SYMBOL_INDODAX}.", "SUCCESS")
             return True
         else:
-            log(f"Eksekusi digagalkan server: {order.get('error', 'Error')}", "ERROR")
+            log(f"Ditolak Indodax: {order.get('error', 'Unknown Error')}", "ERROR")
             return False
 
     except Exception as e:
-        log(f"Jalur eksekusi terputus: {e}", "ERROR")
+        log(f"Koneksi Eksekusi Terputus: {e}", "ERROR")
         return False
 
 # ==========================================
-# [5] KANTOR PUSAT OPERASIONAL
+# [5] MAIN LOOP (KANTOR PUSAT)
 # ==========================================
-log(f"--- AsTraDax V3 (Pure Indodax Engine) Aktif ---", "SUCCESS")
-log(f"Sistem bekerja mandiri tanpa koneksi pihak ketiga.", "INFO")
+log(f"--- AsTraDax Ultimate (Yahoo Finance Radar) Aktif ---", "SUCCESS")
+
+# CEK SALDO AWAL AGAR KAMU TENANG
+try:
+    awal_balance = indodax.fetch_balance()
+    idr_awal = awal_balance.get('IDR', {}).get('free', 0)
+    log(f"Koneksi Indodax Sukses! Saldo awal kamu: Rp {int(idr_awal):,}", "MONEY")
+except Exception as e:
+    log(f"Gagal mengecek saldo awal. Cek API Key kamu! Error: {e}", "ERROR")
 
 while True:
-    df = get_indodax_chart()
+    df = analisa_market_via_yahoo()
     
     if df is not None and not df.empty:
         curr = df.iloc[-1]
@@ -142,15 +133,15 @@ while True:
         macd_ok = curr['macd_hist'] > 0  
         bb_ok = curr['close'] <= curr['bb_lower'] 
         
-        # Tampilan terminal yang rapi
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] 🧐 Harga: Rp{curr['close']:,.0f} | RSI:{curr['rsi']:.1f} | BB_Low: Rp{curr['bb_lower']:,.0f} | MACD:{curr['macd_hist']:.0f}      ", end='\r')
+        # Harga tampil dalam USD (karena dari Yahoo), tapi eksekusi tetap Rupiah di Indodax
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] 🧐 Harga(USD): ${float(curr['close']):,.2f} | RSI:{curr['rsi']:.1f} | BB_Low:${float(curr['bb_lower']):,.0f} | MACD:{curr['macd_hist']:.1f}      ", end='\r')
         
         if rsi_ok and macd_ok and bb_ok:
             print("") 
-            log("Sinyal Triple Konfirmasi Menyala! Memulai operasi pembelian...", "BRAIN")
+            log(f"Sinyal Valid Ditemukan! Menginisiasi pembelian...", "BRAIN")
             
             if eksekusi_beli_pasti():
-                log(f"Sistem pendingin aktif selama {COOLDOWN/60} menit.", "INFO")
+                log(f"Bot istirahat sejenak selama {COOLDOWN/60} menit...", "INFO")
                 time.sleep(COOLDOWN)
     
     time.sleep(SCAN_INTERVAL)
