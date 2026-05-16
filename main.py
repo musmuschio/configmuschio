@@ -1,16 +1,13 @@
 import os
-import ccxt
 import time
+import requests
 import pandas as pd
-import yfinance as yf
 import warnings
+import ccxt
 from datetime import datetime
 from dotenv import load_dotenv
 
-# Matikan peringatan dari library
 warnings.filterwarnings('ignore')
-
-# Muat variabel dari file .env
 load_dotenv()
 
 # ==========================================
@@ -20,8 +17,7 @@ API_KEY = os.getenv('API_KEY')
 SECRET_KEY = os.getenv('SECRET_KEY')
 
 SYMBOL_INDODAX = 'BTC/IDR'     
-SYMBOL_YAHOO = 'BTC-USD'       
-BUY_AMOUNT_IDR = 25000         
+BUY_AMOUNT_IDR = 14000          # Amunisi 14 ribu (berbagi dengan PEPE)
 
 RSI_PERIOD = 14
 RSI_OVERSOLD = 30
@@ -34,11 +30,11 @@ def log(msg, level="INFO"):
     print(f"[{now}] {icons.get(level, '🔹')} {msg}")
 
 if not API_KEY or not SECRET_KEY:
-    log("KUNCI RAHASIA TIDAK DITEMUKAN! Pastikan file .env sudah dibuat dan diisi.", "ERROR")
+    log("KUNCI RAHASIA TIDAK DITEMUKAN! Pastikan file .env sudah diisi.", "ERROR")
     exit()
 
 # ==========================================
-# [2] INISIALISASI MESIN EKSEKUSI INDODAX
+# [2] MESIN EKSEKUSI (INDODAX)
 # ==========================================
 indodax = ccxt.indodax({
     'apiKey': API_KEY,
@@ -47,23 +43,23 @@ indodax = ccxt.indodax({
 })
 
 # ==========================================
-# [3] RADAR YAHOO FINANCE (DIHANCURKAN & DIBANGUN ULANG)
+# [3] RADAR BINANCE VISION (ANTI-BLOKIR)
 # ==========================================
-def analisa_market_via_yahoo():
+def analisa_market_via_vision():
     try:
-        raw = yf.download(tickers=SYMBOL_YAHOO, period='5d', interval='1m', progress=False)
+        url = "https://data-api.binance.vision/api/v3/klines"
+        params = {
+            "symbol": "BTCUSDT",  # Radar diarahkan ke Bitcoin
+            "interval": "1m",
+            "limit": 100
+        }
         
-        if raw.empty:
-            return None
-            
-        # PERBAIKAN MUTLAK FATAL: Membuang semua format Yahoo dan membuat tabel Pandas murni
-        # Menggunakan .values.flatten() untuk memastikan ini adalah array 1 Dimensi biasa
-        df = pd.DataFrame({
-            'close': raw['Close'].values.flatten(),
-            'low': raw['Low'].values.flatten()
-        })
+        response = requests.get(url, params=params, timeout=10)
+        data = response.json()
         
-        # Hitung Indikator (Sekarang pasti aman karena tabelnya sudah bersih)
+        df = pd.DataFrame(data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_vol', 'trades', 'taker_base', 'taker_quote', 'ignore'])
+        df['close'] = df['close'].astype(float)
+        
         delta = df['close'].diff()
         gain = (delta.where(delta > 0, 0)).rolling(window=RSI_PERIOD).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(window=RSI_PERIOD).mean()
@@ -82,7 +78,7 @@ def analisa_market_via_yahoo():
         
         return df
     except Exception as e:
-        log(f"Gangguan sinyal Yahoo: {e}", "ERROR")
+        log(f"Jalur Binance Vision terganggu: {e}", "ERROR")
         return None
 
 # ==========================================
@@ -108,8 +104,7 @@ def eksekusi_beli_pasti():
         })
         
         if order.get('success') == 1 or order.get('success') == '1':
-            terima = order.get('return', {}).get('receive_btc', 'koin')
-            log(f"TRANSAKSI SUKSES! Saldo Rp{BUY_AMOUNT_IDR} telah menjadi {terima} {SYMBOL_INDODAX}.", "SUCCESS")
+            log(f"TRANSAKSI SUKSES! Pasukan BTC berhasil diamankan senilai Rp{BUY_AMOUNT_IDR}.", "SUCCESS")
             return True
         else:
             log(f"Ditolak Indodax: {order.get('error', 'Unknown Error')}", "ERROR")
@@ -120,22 +115,21 @@ def eksekusi_beli_pasti():
         return False
 
 # ==========================================
-# [5] MAIN LOOP (KANTOR PUSAT)
+# [5] MAIN LOOP (KANTOR PUSAT SNIPER)
 # ==========================================
-log(f"--- AsTraDax Ultimate (Secure .env Mode) Aktif ---", "SUCCESS")
+log(f"--- AsTraDax Sniper Unit (Binance Vision) Aktif ---", "SUCCESS")
 
-# CEK SALDO AWAL 
 try:
     awal_balance = indodax.fetch_balance()
     idr_awal = awal_balance.get('IDR', {}).get('free', 0)
     log(f"Koneksi API Aman! Saldo awal kamu: Rp {int(idr_awal):,}", "MONEY")
 except Exception as e:
-    log(f"Gagal verifikasi kunci API ke server Indodax. Cek isi file .env! Error: {e}", "ERROR")
+    log(f"Gagal verifikasi kunci API. Error: {e}", "ERROR")
     exit()
 
 while True:
     try:
-        df = analisa_market_via_yahoo()
+        df = analisa_market_via_vision()
         
         if df is not None and not df.empty:
             curr = df.iloc[-1]
@@ -144,17 +138,16 @@ while True:
             macd_ok = curr['macd_hist'] > 0  
             bb_ok = curr['close'] <= curr['bb_lower'] 
             
-            # Sekarang ini 100% pasti angka mutlak (float), bukan Series lagi
             harga_usd = float(curr['close'])
             rsi_val = float(curr['rsi'])
             bb_low_val = float(curr['bb_lower'])
             macd_val = float(curr['macd_hist'])
             
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] 🧐 Harga(USD): ${harga_usd:,.2f} | RSI:{rsi_val:.1f} | BB_Low:${bb_low_val:,.0f} | MACD:{macd_val:.1f}      ", end='\r')
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] 🧐 Harga(USDT): ${harga_usd:,.2f} | RSI:{rsi_val:.1f} | BB_Low:${bb_low_val:,.0f} | MACD:{macd_val:.1f}      ", end='\r')
             
             if rsi_ok and macd_ok and bb_ok:
                 print("") 
-                log(f"Sinyal Valid Ditemukan! Menginisiasi pembelian...", "BRAIN")
+                log(f"Sinyal Valid Ditemukan! Bitcoin Diskon, Menginisiasi pembelian...", "BRAIN")
                 
                 if eksekusi_beli_pasti():
                     log(f"Bot istirahat sejenak selama {COOLDOWN/60} menit...", "INFO")
@@ -164,3 +157,4 @@ while True:
         log(f"Main Loop Error: {e}", "ERROR")
         
     time.sleep(SCAN_INTERVAL)
+        
