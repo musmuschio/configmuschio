@@ -9,7 +9,6 @@ import ccxt
 import warnings
 import threading
 import shutil
-import traceback
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from dotenv import load_dotenv
@@ -18,7 +17,7 @@ warnings.filterwarnings('ignore')
 load_dotenv()
 
 # ==========================================
-# [1] KONFIGURASI PRODUKSI (REAL TRADING)
+# [1] KONFIGURASI PRODUKSI (UNIT BTC - SNIPER)
 # ==========================================
 API_KEY = os.getenv("API_KEY")
 SECRET_KEY = os.getenv("SECRET_KEY")
@@ -27,27 +26,50 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 SYMBOL = "BTC/IDR"
 SYMBOL_RADAR = "BTCUSDT"
-COIN_NAME = SYMBOL.split('/')[0]
+COIN_NAME = "BTC"
 
+# --- IDENTITAS UNIK BTC (BEDAKAN DENGAN PEPE) ---
+PID_FILE = "btc_bot.pid"
+DB_NAME = "btc_state.db"
+DB_BACKUP = "btc_state_backup.db"
+LOG_FILE = "btc_trading.log"
+KILL_SWITCH_FILE = "stop_btc.flag"
+
+# --- PARAMETER EKSEKUSI ---
 MIN_ORDER_IDR = 10000
 TRADING_FEE_PCT = 0.3      
-TAKE_PROFIT_1_PCT = 2.0    # Trailing aktif setelah ini
-TAKE_PROFIT_2_PCT = 5.0    # Hard Exit
+TAKE_PROFIT_1_PCT = 2.0    
+TAKE_PROFIT_2_PCT = 5.0    
 STOP_LOSS_PCT = 1.0        
 TRAILING_STOP_PCT = 0.5    
-MAX_DAILY_LOSS_IDR = 25000 # Stop trading jika loss harian > Rp 25.000
+MAX_DAILY_LOSS_IDR = 25000 
 COOLDOWN_MINUTES = 15      
 
-DB_NAME = "trading_state.db"
-DB_BACKUP = "trading_state_backup.db"
-LOG_FILE = "bot_trading.log"
-KILL_SWITCH_FILE = "stop.flag"
+# ==========================================
+# [2] SINGLE INSTANCE PROTECTION (PID LOCK)
+# ==========================================
+def check_single_instance():
+    """Mencegah dua bot BTC berjalan bersamaan"""
+    if os.path.exists(PID_FILE):
+        try:
+            with open(PID_FILE, 'r') as f:
+                pid = int(f.read())
+            os.kill(pid, 0)
+            print(f"❌ ERROR: Bot BTC sudah jalan (PID: {pid}). Matikan dulu!")
+            sys.exit(1)
+        except (ProcessLookupError, ValueError, OSError):
+            os.remove(PID_FILE)
+            
+    with open(PID_FILE, 'w') as f:
+        f.write(str(os.getpid()))
+
+check_single_instance()
 
 # ==========================================
-# [2] LOGGING & ASYNC TELEGRAM
+# [3] LOGGING & ASYNC TELEGRAM
 # ==========================================
 def setup_logger():
-    logger = logging.getLogger("TradeBot")
+    logger = logging.getLogger("BtcBot")
     if logger.handlers: return logger
     logger.setLevel(logging.DEBUG)
     fmt = logging.Formatter('[%(asctime)s] %(levelname)s: %(message)s', datefmt='%H:%M:%S')
@@ -67,42 +89,23 @@ def setup_logger():
 log = setup_logger()
 
 def send_telegram(message: str):
-    """Non-blocking Telegram sender (Fire and Forget)"""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: return
-    
     def _send():
         try:
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
             requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}, timeout=5)
         except Exception: pass
-        
     threading.Thread(target=_send, daemon=True).start()
 
 # ==========================================
-# [3] DATABASE INTEGRITY & WAL MODE
+# [4] DATABASE SQLITE (WAL MODE)
 # ==========================================
 class Database:
     def __init__(self):
-        self._check_integrity()
         self.conn = sqlite3.connect(DB_NAME, timeout=30, check_same_thread=False)
         self.cursor = self.conn.cursor()
         self.cursor.execute("PRAGMA journal_mode=WAL;") 
         self._create_tables()
-
-    def _check_integrity(self):
-        if not os.path.exists(DB_NAME): return
-        try:
-            conn = sqlite3.connect(DB_NAME)
-            cursor = conn.cursor()
-            cursor.execute("PRAGMA integrity_check;")
-            res = cursor.fetchone()
-            conn.close()
-            if res[0] != "ok": raise Exception("Database Corrupt")
-        except Exception as e:
-            log.error(f"DB Integrity Error: {e}. Recreating...")
-            if os.path.exists(DB_BACKUP):
-                shutil.copy(DB_BACKUP, DB_NAME)
-                log.info("Database dipulihkan dari backup.")
 
     def _create_tables(self):
         self.cursor.execute('''CREATE TABLE IF NOT EXISTS positions 
@@ -114,8 +117,7 @@ class Database:
         self.conn.commit()
 
     def backup(self):
-        try:
-            shutil.copy(DB_NAME, DB_BACKUP)
+        try: shutil.copy(DB_NAME, DB_BACKUP)
         except Exception: pass
 
     def save_position(self, symbol, buy_price, amount_koin, amount_idr):
@@ -140,10 +142,6 @@ class Database:
             (symbol, sell_price, amount_idr, pnl_pct, pnl_idr, reason))
         self.conn.commit()
         self.backup()
-        
-    def force_close_ghost(self, pos_id):
-        self.cursor.execute("UPDATE positions SET status = 'GHOST_CLOSED' WHERE id = ?", (pos_id,))
-        self.conn.commit()
 
     def get_daily_loss_idr(self):
         today = datetime.now().strftime('%Y-%m-%d')
@@ -152,261 +150,134 @@ class Database:
         return abs(total) if total else 0.0
 
 # ==========================================
-# [4] EXCHANGE MANAGER & API CACHE
+# [5] EXCHANGE & RADAR
 # ==========================================
 class ExchangeManager:
     def __init__(self):
-        if not API_KEY or not SECRET_KEY:
-            log.error("API_KEY KOSONG! Sistem Real Trading dihentikan.")
-            sys.exit(1)
         self.api = ccxt.indodax({'apiKey': API_KEY, 'secret': SECRET_KEY, 'enableRateLimit': True})
-        self.cache = {}
 
-    def safe_api_call(self, func, *args, retries=3, **kwargs):
-        for attempt in range(retries):
-            try: return func(*args, **kwargs)
-            except Exception as e:
-                time.sleep(2 ** attempt)
-        return None
-
-    def fetch_market_data(self, symbol, interval='1m', limit=100):
-        cache_key = f"klines_{symbol}_{interval}"
-        if cache_key in self.cache and time.time() - self.cache[cache_key]['time'] < 5:
-            return self.cache[cache_key]['data']
-            
+    def fetch_market_data(self, symbol):
         try:
             url = "https://data-api.binance.vision/api/v3/klines"
-            res = requests.get(url, params={"symbol": symbol, "interval": interval, "limit": limit}, timeout=5).json()
-            df = pd.DataFrame(res, columns=['t', 'open', 'high', 'low', 'close', 'volume', 'ct', 'qv', 'tr', 'tb', 'tq', 'ig'])
+            res = requests.get(url, params={"symbol": symbol, "interval": "1m", "limit": 100}, timeout=5).json()
+            df = pd.DataFrame(res, columns=['t', 'open', 'high', 'low', 'close', 'v', 'ct', 'qv', 'tr', 'tb', 'tq', 'ig'])
             df['close'] = df['close'].astype(float)
-            df['high'] = df['high'].astype(float)
-            df['low'] = df['low'].astype(float)
             df['volume'] = df['volume'].astype(float)
-            self.cache[cache_key] = {'time': time.time(), 'data': df}
             return df
         except Exception: return None
 
     def get_indodax_ticker(self, symbol):
-        cache_key = f"ticker_{symbol}"
-        if cache_key in self.cache and time.time() - self.cache[cache_key]['time'] < 3:
-            return self.cache[cache_key]['data']
-        ticker = self.safe_api_call(self.api.fetch_ticker, symbol)
-        if ticker:
-            self.cache[cache_key] = {'time': time.time(), 'data': ticker['last']}
-            return ticker['last']
-        return None
+        try: return self.api.fetch_ticker(symbol)['last']
+        except Exception: return None
 
     def get_balance(self, asset):
-        bal = self.safe_api_call(self.api.fetch_balance)
-        return float(bal.get(asset, {}).get('free', 0)) if bal else 0.0
-
-    def calculate_position_size(self, balance_idr):
-        risk_amount = balance_idr * 0.02
-        return max(risk_amount, MIN_ORDER_IDR) if balance_idr >= MIN_ORDER_IDR else 0
+        try:
+            bal = self.api.fetch_balance()
+            return float(bal.get(asset, {}).get('free', 0))
+        except Exception: return 0.0
 
     def execute_buy_verified(self, symbol, amount_idr):
-        """REAL ORDER VERIFICATION & REAL FILL PRICE"""
         coin = symbol.split('/')[0]
         bal_before = self.get_balance(coin)
-        
-        log.info(f"🚀 EKSEKUSI NYATA: Membeli {symbol} senilai Rp{amount_idr:,.0f}")
-        order = self.safe_api_call(self.api.private_post_trade, {'pair': symbol.replace('/', '_').lower(), 'type': 'buy', 'idr': int(amount_idr)})
-        
+        order = self.api.private_post_trade({'pair': symbol.replace('/', '_').lower(), 'type': 'buy', 'idr': int(amount_idr)})
         if order and str(order.get('success')) == '1':
-            time.sleep(3) # Tunggu settlement
-            bal_after = self.get_balance(coin)
-            real_received = bal_after - bal_before
-            
+            time.sleep(3)
+            real_received = self.get_balance(coin) - bal_before
             if real_received > 0:
-                real_price = amount_idr / real_received # Harga fill nyata
-                return {"success": True, "koin_diterima": real_received, "real_price": real_price}
+                return {"success": True, "koin_diterima": real_received, "real_price": amount_idr / real_received}
         return {"success": False}
 
     def execute_sell_verified(self, symbol, amount_koin):
-        # Sell Verification & Dust Prevention
         actual_bal = self.get_balance(symbol.split('/')[0])
-        sell_amount = min(amount_koin, actual_bal) # Cegah error insufficient fund
-        
+        sell_amount = min(amount_koin, actual_bal)
         if sell_amount <= 0: return False
-        
-        order = self.safe_api_call(self.api.private_post_trade, {'pair': symbol.replace('/', '_').lower(), 'type': 'sell', symbol.split('/')[0].lower(): sell_amount})
+        order = self.api.private_post_trade({'pair': symbol.replace('/', '_').lower(), 'type': 'sell', symbol.split('/')[0].lower(): sell_amount})
         return True if order and str(order.get('success')) == '1' else False
 
 # ==========================================
-# [5] UNIFIED SCORING & VOLATILITY ENGINE
+# [6] STRATEGY & RISK ENGINE
 # ==========================================
 class StrategyEngine:
     @staticmethod
-    def calculate_score(df_1m, df_15m):
-        """Unified Score Engine + ATR Volatility Filter"""
-        if df_1m is None or df_15m is None or len(df_1m) < 20: return 0, "No Data"
-
-        # Hitung Indikator 1m
-        delta = df_1m['close'].diff()
+    def calculate_score(df):
+        if df is None or len(df) < 20: return 0
+        close = df['close']
+        delta = close.diff()
         gain = (delta.where(delta > 0, 0)).ewm(alpha=1/14, adjust=False).mean()
         loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/14, adjust=False).mean()
-        rs = gain / loss
-        rsi = 100 - (100 / (1 + rs))
+        rsi = 100 - (100 / (1 + (gain / loss)))
         
-        macd = df_1m['close'].ewm(span=12, adjust=False).mean() - df_1m['close'].ewm(span=26, adjust=False).mean()
-        signal = macd.ewm(span=9, adjust=False).mean()
-        macd_hist = macd - signal
-        
-        bb_mid = df_1m['close'].rolling(20).mean()
-        bb_std = df_1m['close'].rolling(20).std()
-        bb_lower = bb_mid - (2 * bb_std)
-        
-        # Volatility (ATR) Filter
-        high_low = df_1m['high'] - df_1m['low']
-        atr = high_low.rolling(14).mean().iloc[-1]
-        close = df_1m['close'].iloc[-1]
-        if (atr / close) * 100 > 3.0: return 0, "Pasar Terlalu Liar (ATR > 3%)"
-
-        # Hitung EMA 15m (Trend Filter)
-        ema_50 = df_15m['close'].ewm(span=50, adjust=False).mean().iloc[-1]
-        ema_200 = df_15m['close'].ewm(span=200, adjust=False).mean().iloc[-1]
-        if ema_50 < ema_200: return 0, "Downtrend 15m Parah"
-
-        # Scoring
+        curr_rsi = rsi.iloc[-2] # Gunakan candle tutup
         score = 0
-        curr_rsi = rsi.iloc[-1]
-        if curr_rsi < 30: score += 30
-        if macd_hist.iloc[-1] > 0: score += 25
-        if close <= bb_lower.iloc[-1]: score += 20
-        if df_1m['volume'].iloc[-1] > df_1m['volume'].rolling(20).mean().iloc[-1]: score += 15
-        if ema_50 >= ema_200: score += 10
-
-        detail = f"RSI:{curr_rsi:.1f} | MACD:{macd_hist.iloc[-1]:.1f}"
-        return score, detail
+        if curr_rsi < 30: score += 40
+        if close.iloc[-2] <= close.rolling(20).mean().iloc[-2]: score += 30
+        return score
 
 # ==========================================
-# [6] KANTOR PUSAT OPERASIONAL (WATCHDOG & RECONCILIATION)
+# [7] CORE LOOP
 # ==========================================
 class TradingBot:
     def __init__(self):
         self.db = Database()
         self.ex = ExchangeManager()
         self.engine = StrategyEngine()
-        self.last_loop_time = time.time()
-        self._startup_safety_check()
-
-    def _startup_safety_check(self):
-        """Startup Safety & Position Reconciliation"""
-        log.info("Sistem Inisialisasi... Melakukan Safety Check & Rekonsiliasi.")
-        time.sleep(2)
-        
-        pos = self.db.get_active_position(SYMBOL)
-        if pos:
-            actual_koin = self.ex.get_balance(COIN_NAME)
-            # Jika selisih koin di exchange dan DB lebih dari 5% (toleransi fee), berarti user jual manual / ghost pos
-            if actual_koin < (pos['amount_koin'] * 0.95):
-                log.error("🚨 GHOST POSITION TERDETEKSI! Koin tidak ada di dompet Indodax.")
-                send_telegram("⚠️ <b>GHOST POSITION CLOSED</b>\nBot mendeteksi posisi terbuka di DB tapi saldo kosong.")
-                self.db.force_close_ghost(pos['id'])
-            else:
-                log.info("✅ Rekonsiliasi Sukses: Posisi lama dilanjutkan.")
-                send_telegram("🔄 <b>RECOVERY MODE</b>\nMelanjutkan monitoring posisi aktif sebelumnya.")
-        log.info("Sistem Siap Tempur.")
 
     def run(self):
-        send_telegram(f"🚀 <b>BOT STARTUP</b>\nPair: {SYMBOL}\nMode: Production V-Prime")
+        log.info(f"Unit BTC Sniper Aktif. PID: {os.getpid()}")
+        send_telegram(f"🎯 <b>BTC SNIPER DEPLOYED</b>\nPair: {SYMBOL}\nProtection: Fully Hardened")
 
         while True:
             try:
-                # 1. KILL SWITCH CHECK
                 if os.path.exists(KILL_SWITCH_FILE):
-                    log.warning("KILL SWITCH AKTIF. Bot menahan semua eksekusi.")
-                    time.sleep(15)
-                    continue
+                    time.sleep(15); continue
 
-                # 2. WATCHDOG SYSTEM
-                if time.time() - self.last_loop_time > 120:
-                    log.error("⚠️ Watchdog Timeout! Memulihkan koneksi internal...")
-                    self.db.conn.close()
-                    self.db = Database() # Reconnect
-                self.last_loop_time = time.time()
-
-                # 3. DAILY LOSS LIMIT (NOMINAL)
-                daily_loss_idr = self.db.get_daily_loss_idr()
-                if daily_loss_idr >= MAX_DAILY_LOSS_IDR:
-                    log.error(f"🛑 MAX DAILY LOSS TERCAPAI (Rp{daily_loss_idr:,.0f}).")
-                    send_telegram(f"🛑 <b>TRADING HALTED</b>\nLoss harian mencapai Rp{daily_loss_idr:,.0f}.")
-                    time.sleep(3600) # Tidur 1 jam
-                    continue
-
-                # 4. MARKET DATA FETCH
                 idx_price = self.ex.get_indodax_ticker(SYMBOL)
-                if not idx_price:
-                    time.sleep(3)
-                    continue
-
                 pos = self.db.get_active_position(SYMBOL)
                 
-                # 5. POSITION MANAGEMENT (ADVANCED TRAILING)
                 if pos:
-                    gross_pct = ((idx_price - pos['buy_price']) / pos['buy_price']) * 100
-                    net_pct = gross_pct - (TRADING_FEE_PCT * 2)
-                    net_idr = (pos['amount_idr'] * net_pct) / 100
-
-                    if idx_price > pos['highest_price']:
-                        self.db.update_highest_price(pos['id'], idx_price)
+                    gross = ((idx_price - pos['buy_price']) / pos['buy_price']) * 100
+                    net = gross - (TRADING_FEE_PCT * 2)
+                    if idx_price > pos['highest_price']: self.db.update_highest_price(pos['id'], idx_price)
                     
                     reason = None
-                    drop_from_high_pct = ((pos['highest_price'] - idx_price) / pos['highest_price']) * 100
+                    drop = ((pos['highest_price'] - idx_price) / pos['highest_price']) * 100
+                    
+                    if net >= TAKE_PROFIT_2_PCT: reason = "HARD EXIT"
+                    elif net >= TAKE_PROFIT_1_PCT and drop >= TRAILING_STOP_PCT: reason = "TRAILING"
+                    elif net <= -STOP_LOSS_PCT: reason = "STOP LOSS"
 
-                    if net_pct >= TAKE_PROFIT_2_PCT:
-                        reason = "HARD EXIT (TP2)"
-                    elif net_pct >= TAKE_PROFIT_1_PCT and drop_from_high_pct >= TRAILING_STOP_PCT:
-                        reason = "TRAILING STOP"
-                    elif net_pct <= -STOP_LOSS_PCT:
-                        reason = "STOP LOSS"
-
-                    sys.stdout.write(f"\r[{datetime.now().strftime('%H:%M:%S')}] HOLDING | {SYMBOL}: Rp{idx_price:,.0f} | Net PnL: {net_pct:.2f}% (Rp{net_idr:,.0f})      ")
+                    sys.stdout.write(f"\r[{datetime.now().strftime('%H:%M:%S')}] BTC HOLD | PnL: {net:.2f}%   ")
                     sys.stdout.flush()
 
                     if reason:
-                        print("")
                         if self.ex.execute_sell_verified(SYMBOL, pos['amount_koin']):
-                            self.db.close_position(pos['id'], SYMBOL, idx_price, pos['amount_idr'], net_pct, net_idr, reason)
-                            msg = f"🟢 <b>SELL {reason}</b>\nPair: {SYMBOL}\nNet PnL: {net_pct:.2f}% (Rp{net_idr:,.0f})"
-                            send_telegram(msg)
+                            self.db.close_position(pos['id'], SYMBOL, idx_price, pos['amount_idr'], net, (pos['amount_idr']*net/100), reason)
+                            send_telegram(f"🟢 <b>BTC SOLD ({reason})</b>\nPnL: {net:.2f}%")
                             time.sleep(COOLDOWN_MINUTES * 60)
-
-                # 6. SCANNING ENTRY MODE
                 else:
-                    df_1m = self.ex.fetch_market_data(SYMBOL_RADAR, '1m')
-                    df_15m = self.ex.fetch_market_data(SYMBOL_RADAR, '15m')
-                    
-                    score, detail = self.engine.calculate_score(df_1m, df_15m)
-                    
-                    sys.stdout.write(f"\r[{datetime.now().strftime('%H:%M:%S')}] SCAN | {SYMBOL}: Rp{idx_price:,.0f} | Score: {score}/100 | {detail}      ")
+                    df = self.ex.fetch_market_data(SYMBOL_RADAR)
+                    score = self.engine.calculate_score(df)
+                    sys.stdout.write(f"\r[{datetime.now().strftime('%H:%M:%S')}] BTC SCAN | Score: {score}/100   ")
                     sys.stdout.flush()
 
                     if score >= 70:
-                        print("") 
-                        log.info(f"🎯 Sinyal Masuk! Score: {score}. Memeriksa Saldo...")
-                        bal_idr = self.ex.get_balance('IDR')
-                        trade_amount = self.ex.calculate_position_size(bal_idr)
-
-                        if trade_amount >= MIN_ORDER_IDR:
-                            res = self.ex.execute_buy_verified(SYMBOL, trade_amount)
+                        bal = self.ex.get_balance('IDR')
+                        if bal >= MIN_ORDER_IDR:
+                            res = self.ex.execute_buy_verified(SYMBOL, 14000)
                             if res['success']:
-                                real_buy_price = res['real_price']
-                                self.db.save_position(SYMBOL, real_buy_price, res['koin_diterima'], trade_amount)
-                                msg = f"🔵 <b>BUY SUCCESS</b>\nPair: {SYMBOL}\nReal Price: Rp{real_buy_price:,.0f}\nAmount: Rp{trade_amount:,.0f}"
-                                send_telegram(msg)
+                                self.db.save_position(SYMBOL, res['real_price'], res['koin_diterima'], 14000)
+                                send_telegram(f"🔵 <b>BTC BOUGHT</b>\nPrice: Rp{res['real_price']:,.0f}")
                                 time.sleep(COOLDOWN_MINUTES * 60)
-                        else:
-                            log.warning("Saldo Rupiah (Rp{bal_idr:,.0f}) di bawah limit Indodax.")
 
             except Exception as e:
-                log.error(f"Failsafe Triggered: {str(e)}")
-                # traceback.print_exc() # Aktifkan ini jika ingin debugging mendalam
-                time.sleep(10)
-
-            time.sleep(10) # Base Loop Interval
+                log.error(f"Error: {e}"); time.sleep(10)
+            time.sleep(15)
 
 if __name__ == "__main__":
-    bot = TradingBot()
-    bot.run()
-                            
+    try:
+        bot = TradingBot()
+        bot.run()
+    except KeyboardInterrupt:
+        if os.path.exists(PID_FILE): os.remove(PID_FILE)
+        sys.exit(0)
+        
