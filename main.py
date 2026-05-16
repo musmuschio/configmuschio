@@ -1,4 +1,4 @@
-```python
+
 import ccxt
 import time
 import pandas as pd
@@ -148,4 +148,3 @@ while True:
     time.sleep(SCAN_INTERVAL)
 
 
-```
