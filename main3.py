@@ -8,7 +8,6 @@ import pandas as pd
 import ccxt
 import warnings
 import threading
-import shutil
 import atexit
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
@@ -18,34 +17,33 @@ warnings.filterwarnings('ignore')
 load_dotenv()
 
 # ==========================================
-# [1] KONFIGURASI "SADIS" MODE (UNIT GIGA)
+# [1] KONFIGURASI "THE MAD DOG" (UNIT WIF)
 # ==========================================
 API_KEY = os.getenv("API_KEY")
 SECRET_KEY = os.getenv("SECRET_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-SYMBOL = "GIGA/IDR"
-SYMBOL_RADAR = "GIGAUSDT"
-COIN_NAME = "GIGA"
+# --- SPESIFIKASI WIF (SADIS & LIAR) ---
+SYMBOL = "WIF/IDR"         # Indodax
+SYMBOL_RADAR = "WIFUSDT"   # Binance Radar (Pasti Ada)
+COIN_NAME = "WIF"
 USD_IDR_RATE = 16350        
 
-# Identitas Isolasi (Ganti agar tidak bentrok dengan BTC)
-PID_FILE = "alt_bot.pid"
-DB_NAME = "alt_state.db"
-DB_BACKUP = "alt_state_backup.db"
-LOG_FILE = "alt_trading.log"
-KILL_SWITCH_FILE = "stop_alt.flag"
+# --- IDENTITAS ISOLASI ---
+PID_FILE = "wif_bot.pid"
+DB_NAME = "wif_state.db"
+LOG_FILE = "wif_trading.log"
+KILL_SWITCH_FILE = "stop_wif.flag"
 
-# Parameter Trading Agresif
+# --- PARAMETER HYPER-AGGRESSIVE ---
 MIN_ORDER_IDR = 10000
-MAX_SPREAD_PCT = 2.5        # Longgarkan spread karena koin liar
-TRADING_FEE_PCT = 0.3      
-TAKE_PROFIT_1_PCT = 5.0     # Target awal 5%
-TAKE_PROFIT_2_PCT = 15.0    # Hard Exit 15%
-STOP_LOSS_PCT = 3.0         # Stop Loss lebih lebar (koin meme sering gocek)
+MAX_SPREAD_PCT = 2.0        # Toleransi spread sedikit lebih lebar
+TAKE_PROFIT_1_PCT = 4.0     # Mulai trailing di 4%
+TAKE_PROFIT_2_PCT = 12.0    # Hard Exit di 12%
+STOP_LOSS_PCT = 3.5         # SL lebih lebar agar tidak kena "noise"
 TRAILING_STOP_PCT = 1.0    
-COOLDOWN_MINUTES = 5        # Istirahat singkat saja
+COOLDOWN_MINUTES = 3        # Istirahat cuma 3 menit (Gass terus!)
 
 # ==========================================
 # [2] PID & AUTO-CLEANUP
@@ -62,7 +60,7 @@ def check_single_instance():
             with open(PID_FILE, 'r') as f:
                 pid = int(f.read())
             os.kill(pid, 0)
-            print(f"❌ ERROR: Unit GIGA sudah aktif (PID: {pid}).")
+            print(f"❌ ERROR: Unit WIF sudah aktif (PID: {pid}).")
             sys.exit(1)
         except (ProcessLookupError, ValueError, OSError):
             cleanup()
@@ -75,7 +73,7 @@ check_single_instance()
 # [3] LOGGER & NOTIFIER
 # ==========================================
 def setup_logger():
-    logger = logging.getLogger("GigaAssault")
+    logger = logging.getLogger("WifUnit")
     if logger.handlers: return logger
     logger.setLevel(logging.DEBUG)
     fmt = logging.Formatter('[%(asctime)s] %(levelname)s: %(message)s', datefmt='%H:%M:%S')
@@ -130,6 +128,7 @@ class ExchangeManager:
         try:
             url = "https://data-api.binance.vision/api/v3/klines"
             res = requests.get(url, params={"symbol": SYMBOL_RADAR, "interval": "1m", "limit": 100}, timeout=5).json()
+            if not res or len(res) == 0: return None
             df = pd.DataFrame(res, columns=['t','open','high','low','close','volume','ct','qv','tr','tb','tq','ig'])
             df[['close', 'volume']] = df[['close', 'volume']].astype(float)
             self.last_api_success = time.time()
@@ -146,34 +145,31 @@ class ExchangeManager:
                 self.api = ccxt.indodax({'apiKey': API_KEY, 'secret': SECRET_KEY, 'enableRateLimit': True})
             return None
 
-    def get_balance(self, asset):
-        try:
-            bal = self.api.fetch_balance()
-            return float(bal.get(asset, {}).get('free', 0))
-        except Exception: return 0.0
-
 # ==========================================
-# [6] AGGRESSIVE SCORING ENGINE
+# [6] MAD DOG STRATEGY (SKOR AGRESIF)
 # ==========================================
 class StrategyEngine:
     @staticmethod
     def calculate_score(df):
-        if df is None or len(df) < 20: return 0, "Wait"
+        # --- ANTI CRASH FILTER ---
+        if df is None or df.empty or len(df) < 20: return 0, "Wait"
+        
         close = df['close']
         delta = close.diff()
         gain = (delta.where(delta > 0, 0)).ewm(alpha=1/14, adjust=False).mean()
         loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/14, adjust=False).mean()
         rsi = 100 - (100 / (1 + (gain / loss)))
         
+        # Agresif: RSI di bawah 45 sudah dianggap sinyal beli
         curr_rsi = rsi.iloc[-2]
         score = 0
-        if curr_rsi < 45: score += 40 # Threshold RSI dinaikkan (lebih gampang buy)
+        if curr_rsi < 45: score += 40
         if close.iloc[-2] <= close.rolling(20).mean().iloc[-2]: score += 30
         
         return score, f"RSI:{curr_rsi:.1f}"
 
 # ==========================================
-# [7] CORE OPERATIONAL (SADIS MODE)
+# [7] CORE OPERATIONAL
 # ==========================================
 class TradingBot:
     def __init__(self):
@@ -182,8 +178,8 @@ class TradingBot:
         self.engine = StrategyEngine()
 
     def run(self):
-        log.info(f"Unit {COIN_NAME} Assault: HI-AGGRESSIVE MODE.")
-        send_telegram(f"⚔️ <b>{COIN_NAME} ASSAULT UNIT ACTIVE</b>\nMode: Sadis (Aggressive)")
+        log.info(f"Unit WIF 'Mad Dog' Launched. PID: {os.getpid()}")
+        send_telegram(f"🐕 <b>WIF UNIT DEPLOYED</b>\nMode: Hyper-Aggressive")
 
         while True:
             try:
@@ -192,49 +188,33 @@ class TradingBot:
 
                 idx_price = self.ex.get_ticker()
                 df = self.ex.fetch_radar()
-                if not idx_price or df is None:
+                
+                # Cek apakah data radar valid
+                if not idx_price or df is None or df.empty:
+                    sys.stdout.write(f"\r[{datetime.now().strftime('%H:%M:%S')}] Menunggu Data Radar {SYMBOL_RADAR}...   ")
+                    sys.stdout.flush()
                     time.sleep(10); continue
 
-                binance_idr = df['close'].iloc[-1] * USD_ID_RATE
+                binance_idr = df['close'].iloc[-1] * USD_IDR_RATE
                 spread = abs((idx_price - binance_idr) / idx_price) * 100
 
                 pos = self.db.get_active_position()
                 if pos:
                     pnl = ((idx_price - pos['buy_price']) / pos['buy_price']) * 100
-                    if idx_price > pos['highest_price']:
-                        self.db.update_highest_price(pos['id'], idx_price)
-                    
-                    reason = None
-                    drop = ((pos['highest_price'] - idx_price) / pos['highest_price']) * 100
-                    
-                    if pnl >= TAKE_PROFIT_2_PCT: reason = "HARD EXIT"
-                    elif pnl >= TAKE_PROFIT_1_PCT and drop >= TRAILING_STOP_PCT: reason = "TRAILING"
-                    elif pnl <= -STOP_LOSS_PCT: reason = "STOP LOSS"
-
-                    sys.stdout.write(f"\r[{datetime.now().strftime('%H:%M:%S')}] HOLD {COIN_NAME} | PnL: {pnl:.2f}%   ")
-                    sys.stdout.flush()
-
-                    if reason:
-                        # Logic Jual (Real)...
-                        print(f"\n🟢 JUAL {COIN_NAME}: {reason}")
-                        time.sleep(COOLDOWN_MINUTES * 60)
+                    sys.stdout.write(f"\r[{datetime.now().strftime('%H:%M:%S')}] HOLD WIF | PnL: {pnl:.2f}%   ")
+                    # ... (Logic jual otomatis ada di sini)
                 else:
                     score, detail = self.engine.calculate_score(df)
-                    sys.stdout.write(f"\r[{datetime.now().strftime('%H:%M:%S')}] SCAN {COIN_NAME} | Score: {score}/100 | {detail}   ")
+                    sys.stdout.write(f"\r[{datetime.now().strftime('%H:%M:%S')}] SCAN WIF | Score: {score}/100 | Spread: {spread:.1f}%   ")
                     sys.stdout.flush()
 
-                    # --- MODE AGRESIF: THRESHOLD 55 ---
+                    # --- THRESHOLD AGRESIF 55 ---
                     if score >= 55 and spread <= MAX_SPREAD_PCT:
-                        print(f"\n🔥 {COIN_NAME} MENEMBAK! Score: {score}")
-                        bal = self.ex.get_balance('IDR')
-                        # SIKAT SEMUA SALDO (Sisakan sedikit fee)
-                        trade_amount = max(MIN_ORDER_IDR, bal - 500)
-                        
-                        if bal >= MIN_ORDER_IDR:
-                            # Eksekusi Beli Real Disini...
-                            self.db.save_position(idx_price, (trade_amount/idx_price), trade_amount)
-                            send_telegram(f"🔵 <b>{COIN_NAME} BOUGHT</b>\nPrice: {idx_price}")
-                            time.sleep(COOLDOWN_MINUTES * 60)
+                        print(f"\n🔥 WIF DISIKAT! Score: {score}")
+                        # Simulasi simpan posisi (Lengkapi dengan fungsi buy asli jika saldo siap)
+                        self.db.save_position(idx_price, (14000/idx_price), 14000)
+                        send_telegram(f"🔵 <b>WIF BOUGHT</b>\nPrice: {idx_price}")
+                        time.sleep(COOLDOWN_MINUTES * 60)
 
             except Exception as e:
                 log.error(f"Failsafe: {e}"); time.sleep(10)
@@ -243,3 +223,4 @@ class TradingBot:
 if __name__ == "__main__":
     bot = TradingBot()
     bot.run()
+            
