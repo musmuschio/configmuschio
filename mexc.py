@@ -6,11 +6,10 @@ import hashlib
 import requests
 import json
 import urllib3
-import pandas as pd
 from datetime import datetime
 from dotenv import load_dotenv
 
-# [!] MEMPERTAHANKAN BYPASS SSL MUTLAK
+# [!] MEMBUNGKAM PERINGATAN SSL
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 load_dotenv()
 
@@ -32,9 +31,9 @@ RSI_PERIOD = 14
 RSI_OVERSOLD = 30       
 RSI_OVERBOUGHT = 70     
 
-TAKE_PROFIT_PERCENT = 1.5  # Profit 1.5% dari modal (dengan leverage)
-STOP_LOSS_PERCENT = 1.0    # Cut Loss jika minus 1.0%
-COOLDOWN_TIME = 60         # Pendinginan 1 menit setelah transaksi
+TAKE_PROFIT_PERCENT = 1.5  
+STOP_LOSS_PERCENT = 1.0    
+COOLDOWN_TIME = 60         
 
 # ==========================================
 # [2] ENGINE RAW API (FONDASI YANG TERBUKTI JALAN)
@@ -55,23 +54,18 @@ class MexcEngine:
 
         try:
             if method == "GET":
-                # GET Mutlak: Signature tanpa payload
                 headers["Signature"] = self._generate_signature(timestamp)
                 res = requests.get(url, headers=headers, timeout=10, verify=False)
             else:
-                # POST Mutlak: Signature dengan payload
                 headers["Signature"] = self._generate_signature(timestamp, payload)
                 res = requests.post(url, headers=headers, data=payload, timeout=10, verify=False)
             
-            # Cek keamanan response
             if res.status_code != 200:
                 return {"success": False, "error": f"HTTP {res.status_code}"}
             return res.json()
-            
         except Exception as e:
             return {"success": False, "error": str(e)}
 
-    # --- API ENDPOINTS ---
     def get_balance(self):
         res = self._request("GET", "/api/v1/private/account/assets")
         if res and res.get("success") and res.get("data"):
@@ -81,67 +75,85 @@ class MexcEngine:
         return 0.0
 
     def get_klines(self, symbol):
-        # Jalur Publik Aman untuk RSI
         url = f"{self.base_url}/api/v1/contract/kline/{symbol}?interval=Min1&limit={RSI_PERIOD + 10}"
         try:
             res = requests.get(url, timeout=10, verify=False).json()
-            if res and res.get("success") and "data" in res:
+            if res and res.get("success") and "data" in res and "close" in res["data"]:
                 return [float(p) for p in res["data"]["close"]]
         except:
             pass
         return []
 
     def get_real_position(self, symbol):
-        # Mencegah halusinasi posisi
         res = self._request("GET", "/api/v1/private/position/open_positions")
         if res and res.get("success") and res.get("data"):
             for pos in res["data"]:
                 if pos["symbol"] == symbol and pos["vol"] > 0:
                     return {
-                        "positionType": pos["positionType"], # 1: Long, 2: Short
+                        "positionType": pos["positionType"], 
                         "holdAvgPrice": float(pos["holdAvgPrice"]),
                         "vol": pos["vol"]
                     }
         return None
 
     def execute_order(self, symbol, side, vol, leverage):
-        # FIX FATAL: Menghapus "price" untuk Market Order agar tidak ditolak MEXC
         data = {
             "symbol": symbol,
             "vol": vol,
             "leverage": leverage,
             "side": side,
-            "type": 5, # 5 = Market Order (Instan)
-            "openType": 1 # 1 = Isolated Margin
+            "type": 5, 
+            "openType": 1 
         }
         action = {1: "OPEN LONG", 2: "CLOSE LONG", 3: "OPEN SHORT", 4: "CLOSE SHORT"}
         print(f"\n[!] TRANSMISI API: {action.get(side, 'UNKNOWN')} | Vol: {vol} | Lev: {leverage}x")
         return self._request("POST", "/api/v1/private/order/submit", params=data)
 
 # ==========================================
-# [3] OTAK ALGORITMA (CANDLE-BASED RSI)
+# [3] OTAK ALGORITMA (PURE PYTHON - ANTI CRASH)
 # ==========================================
 def calculate_rsi(prices, period=14):
-    if len(prices) < period + 1:
+    # Pelindung mutlak: Jika data rusak, kembalikan 50 (Netral)
+    if not isinstance(prices, list) or len(prices) < period + 1:
         return 50.0
-    df = pd.DataFrame(prices, columns=['close'])
-    delta = df['close'].diff()
-    gain = delta.where(delta > 0, 0.0).rolling(window=period).mean()
-    loss = -delta.where(delta < 0, 0.0).rolling(window=period).mean()
-    g = gain.iloc[-1]
-    l = loss.iloc[-1]
-    if l == 0:
-        return 100.0 if g > 0 else 50.0
-    rs = g / l
+    
+    try:
+        prices = [float(p) for p in prices]
+    except Exception:
+        return 50.0
+
+    gains = []
+    losses = []
+    
+    for i in range(1, len(prices)):
+        change = prices[i] - prices[i-1]
+        if change > 0:
+            gains.append(change)
+            losses.append(0.0)
+        else:
+            gains.append(0.0)
+            losses.append(abs(change))
+            
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+        
+    if avg_loss == 0:
+        return 100.0
+        
+    rs = avg_gain / avg_loss
     rsi = 100 - (100 / (1 + rs))
     return float(rsi)
 
 # ==========================================
-# [4] TERMINAL TTY LOOP (HIATUS AUTOPILOT)
+# [4] TERMINAL TTY LOOP (INDESTRUCTIBLE EDITION)
 # ==========================================
 def run_autonomous_bot():
     engine = MexcEngine()
-    print(f"\n[*] PROTOKOL VANGUARD AKTIF | MODE: HIATUS SAFE")
+    print(f"\n[*] PROTOKOL VANGUARD AKTIF | MODE: INDESTRUCTIBLE")
     
     saldo = engine.get_balance()
     if saldo == 0.0:
@@ -160,8 +172,8 @@ def run_autonomous_bot():
         
         # 1. PENGAMBILAN DATA
         prices = engine.get_klines(SYMBOL)
-        if not prices:
-            sys.stdout.write(f"\r[{waktu_sekarang}] Menunggu sinkronisasi data harga...".ljust(85))
+        if not prices or len(prices) < 2:
+            sys.stdout.write(f"\r[{waktu_sekarang}] Menunggu sinkronisasi data harga (WARP/API)...".ljust(85))
             sys.stdout.flush()
             time.sleep(2)
             continue
@@ -177,7 +189,6 @@ def run_autonomous_bot():
             tipe = "LONG" if posisi_aktif["positionType"] == 1 else "SHORT"
             entry = posisi_aktif["holdAvgPrice"]
             
-            # Perhitungan PNL % Asli
             if tipe == "LONG":
                 pnl_pct = ((harga_sekarang - entry) / entry) * 100 * LEVERAGE
             else:
@@ -198,7 +209,6 @@ def run_autonomous_bot():
         if posisi_aktif:
             tipe = "LONG" if posisi_aktif["positionType"] == 1 else "SHORT"
             
-            # Logika Take Profit & Stop Loss
             if pnl_pct >= TAKE_PROFIT_PERCENT:
                 print(f"\n[🎯] TAKE PROFIT ({pnl_pct:+.2f}%)! MENUTUP POSISI...")
                 res = engine.execute_order(SYMBOL, 2 if tipe == "LONG" else 4, posisi_aktif["vol"], LEVERAGE)
@@ -244,5 +254,5 @@ if __name__ == "__main__":
             print(f"\n\n[☠️] KONEKSI TERSENDAT: {e}")
             print(f"[⚙️] Auto-Revive aktif. Restart dalam {backoff} detik...")
             time.sleep(backoff)
-            backoff = min(backoff * 2, 60) # Mencegah spam jika MEXC down
-            
+            backoff = min(backoff * 2, 60)
+        
