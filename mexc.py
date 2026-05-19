@@ -10,28 +10,32 @@ import pandas as pd
 from datetime import datetime
 from dotenv import load_dotenv
 
-# Membungkam peringatan SSL agar terminal tetap bersih
+# [!] MEMBUNGKAM PERINGATAN SSL
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 load_dotenv()
 
 # ==========================================
-# [1] KONFIGURASI TEMPUR (PRO-GRADE)
+# [1] KONFIGURASI TEMPUR
 # ==========================================
 API_KEY = os.getenv("MEXC_API_KEY", "").strip()
 SECRET_KEY = os.getenv("MEXC_SECRET_KEY", "").strip()
 
-SYMBOL = "BTC_USDT"
-LEVERAGE = 20
-TRADE_VOL = 1           # Jumlah kontrak minimum
-RSI_PERIOD = 14
-RSI_OVERSOLD = 30       # Pemicu Open Long (Beli Naik)
-RSI_OVERBOUGHT = 70     # Pemicu Open Short (Beli Turun)
+if not API_KEY or not SECRET_KEY:
+    print("❌ ERROR: Kunci MEXC tidak ditemukan di .env!")
+    sys.exit(1)
 
-HOLD_TIME_LIMIT = 180   # Tahan posisi maksimal 3 menit (180 detik)
-COOLDOWN_TIME = 180     # Istirahat 3 menit setelah transaksi
+SYMBOL = "BTC_USDT"     
+LEVERAGE = 20           
+TRADE_VOL = 1           
+RSI_PERIOD = 14         
+RSI_OVERSOLD = 30       
+RSI_OVERBOUGHT = 70     
+
+HOLD_TIME_LIMIT = 180   # Waktu tahan posisi (3 menit)
+COOLDOWN_TIME = 60      # Istirahat setelah untung (1 menit)
 
 # ==========================================
-# [2] ENGINE RAW API MEXC
+# [2] ENGINE RAW API (BERDASARKAN KODEMU YG JALAN)
 # ==========================================
 class MexcEngine:
     def __init__(self):
@@ -58,6 +62,16 @@ class MexcEngine:
         except Exception as e:
             return {"success": False, "error": str(e)}
 
+    def get_ticker(self, symbol):
+        # Menggunakan jalur yang sudah terbukti sukses di mesinmu
+        try:
+            res = requests.get(f"{self.base_url}/api/v1/contract/ticker?symbol={symbol}", verify=False).json()
+            if res and res.get("success"):
+                return float(res["data"]["lastPrice"])
+        except:
+            pass
+        return 0.0
+
     def get_balance(self):
         res = self._request("GET", "/api/v1/private/account/assets")
         if res and res.get("success") and res.get("data"):
@@ -66,77 +80,73 @@ class MexcEngine:
                     return float(asset["availableBalance"])
         return 0.0
 
-    def get_klines(self, symbol):
-        url = f"{self.base_url}/api/v1/contract/kline/{symbol}?interval=Min1&limit=50"
-        try:
-            res = requests.get(url, timeout=10, verify=False).json()
-            if res.get("success") and "data" in res:
-                return [float(p) for p in res["data"]["close"]]
-            return []
-        except:
-            return []
-
     def execute_order(self, symbol, side, vol, leverage):
-        # SIDE CODE MEXC: 1 (Open Long), 2 (Close Long), 3 (Open Short), 4 (Close Short)
         data = {
-            "symbol": symbol,
-            "price": "",
-            "vol": vol,
-            "leverage": leverage,
-            "side": side,
-            "type": 5, # Market Order (Instan)
-            "openType": 1 # Isolated Margin
+            "symbol": symbol, "price": "", "vol": vol, "leverage": leverage,
+            "side": side, "type": 5, "openType": 1
         }
         action = {1: "OPEN LONG", 2: "CLOSE LONG", 3: "OPEN SHORT", 4: "CLOSE SHORT"}
         print(f"\n[!] TRANSMISI API: Mengeksekusi {action[side]} | Vol: {vol} | Lev: {leverage}x")
         return self._request("POST", "/api/v1/private/order/submit", params=data)
 
 # ==========================================
-# [3] OTAK ALGORITMA (INDIKATOR)
+# [3] OTAK ALGORITMA (TICK-BASED RSI)
 # ==========================================
 def calculate_rsi(prices, period=14):
     if len(prices) < period + 1:
         return 50.0
     df = pd.DataFrame(prices, columns=['close'])
     delta = df['close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    rs = gain / loss
+    
+    gain = delta.where(delta > 0, 0.0).rolling(window=period).mean()
+    loss = -delta.where(delta < 0, 0.0).rolling(window=period).mean()
+    
+    g = gain.iloc[-1]
+    l = loss.iloc[-1]
+    
+    if l == 0:
+        return 100.0 if g > 0 else 50.0
+        
+    rs = g / l
     rsi = 100 - (100 / (1 + rs))
-    return float(rsi.iloc[-1])
+    return float(rsi)
 
 # ==========================================
-# [4] STATE MACHINE (SISTEM AUTOPILOT)
+# [4] TERMINAL TTY LOOP (AUTOPILOT)
 # ==========================================
 def run_autonomous_bot():
     engine = MexcEngine()
-    print("\n" + "="*80)
-    print(f"[*] PROTOKOL 'NIGHT WATCHMAN' AKTIF | MODE: HIATUS AUTOPILOT")
-    print("="*80)
+    print(f"\n[*] PROTOKOL 'NIGHT WATCHMAN' AKTIF | MODE: TICK-SCALPING")
     
     saldo = engine.get_balance()
-    print(f"[✅] Verifikasi Sistem Berhasil. Amunisi: ${saldo:.4f} USDT | Target: {SYMBOL}\n")
+    print(f"[✅] Amunisi: ${saldo:.4f} USDT | Target: {SYMBOL}\n")
+    print("="*80)
 
-    # State Variables
     status_mesin = "MENGINTAI" 
     waktu_buka_posisi = 0
     waktu_mulai_cooldown = 0
+    price_history = []
+    
+    print("[*] Mengumpulkan data harga secara live... (Butuh ~30 detik pemanasan)")
     
     while True:
         waktu_sekarang = datetime.now().strftime("%H:%M:%S")
         timestamp_sekarang = time.time()
         
-        prices = engine.get_klines(SYMBOL)
-        if not prices:
-            time.sleep(2) # Jika gagal ambil harga, tunggu sebentar
+        # Ekstraksi harga (Aman & Terbukti)
+        harga_sekarang = engine.get_ticker(SYMBOL)
+        if harga_sekarang == 0.0:
+            time.sleep(2)
             continue
             
-        harga_sekarang = prices[-1]
-        rsi_sekarang = calculate_rsi(prices, RSI_PERIOD)
+        # Simpan jejak harga ke memori lokal
+        price_history.append(harga_sekarang)
+        if len(price_history) > 60:
+            price_history.pop(0)
+            
+        rsi_sekarang = calculate_rsi(price_history, RSI_PERIOD)
         
-        # ---------------------------------------
-        # LOGIKA TAMPILAN RADAR TTY
-        # ---------------------------------------
+        # LOGIKA VISUAL RADAR
         if status_mesin == "LONG" or status_mesin == "SHORT":
             durasi = int(timestamp_sekarang - waktu_buka_posisi)
             teks_status = f"DALAM POSISI {status_mesin} ⏳ ({durasi}d / {HOLD_TIME_LIMIT}d)"
@@ -144,75 +154,73 @@ def run_autonomous_bot():
             sisa_cooldown = int(COOLDOWN_TIME - (timestamp_sekarang - waktu_mulai_cooldown))
             teks_status = f"PENDINGINAN MESIN ❄️ ({sisa_cooldown}d)"
         else:
-            teks_status = "MENGINTAI MOMEN 🎯"
+            if len(price_history) <= RSI_PERIOD:
+                teks_status = f"MENGUMPULKAN DATA 🔄 ({len(price_history)}/{RSI_PERIOD})"
+            else:
+                teks_status = "MENGINTAI MOMEN 🎯"
 
         sys.stdout.write(f"\r[{waktu_sekarang}] {SYMBOL} | Harga: ${harga_sekarang:,.2f} | Saldo: ${saldo:.4f} | RSI: {rsi_sekarang:05.1f} | {teks_status}".ljust(90))
         sys.stdout.flush()
 
-        # ---------------------------------------
-        # LOGIKA EKSEKUSI (STATE MACHINE)
-        # ---------------------------------------
-        if status_mesin == "MENGINTAI":
-            if rsi_sekarang <= RSI_OVERSOLD:
-                print(f"\n[🔥] RSI {rsi_sekarang:.1f} (OVERSOLD) TERDETEKSI! MEMBUKA POSISI LONG...")
-                res = engine.execute_order(SYMBOL, 1, TRADE_VOL, LEVERAGE)
-                if res and res.get('success'):
-                    print("[✅] Order LONG Berhasil! Masuk mode tempur.")
-                    status_mesin = "LONG"
-                    waktu_buka_posisi = time.time()
-                else:
-                    print(f"[❌] Gagal Open Long: {res.get('error', 'Unknown Error')}")
-                    time.sleep(5)
+        # LOGIKA EKSEKUSI TRADING
+        if len(price_history) > RSI_PERIOD:
+            if status_mesin == "MENGINTAI":
+                if rsi_sekarang <= RSI_OVERSOLD:
+                    print(f"\n[🔥] RSI {rsi_sekarang:.1f} (OVERSOLD)! MEMBUKA POSISI LONG...")
+                    res = engine.execute_order(SYMBOL, 1, TRADE_VOL, LEVERAGE)
+                    if res and res.get('success'):
+                        print("[✅] LONG Berhasil! Menahan posisi selama 3 menit.")
+                        status_mesin = "LONG"
+                        waktu_buka_posisi = time.time()
+                    else:
+                        print(f"\n[❌] Gagal Open: {res}")
+                        time.sleep(2)
 
-            elif rsi_sekarang >= RSI_OVERBOUGHT:
-                print(f"\n[🧊] RSI {rsi_sekarang:.1f} (OVERBOUGHT) TERDETEKSI! MEMBUKA POSISI SHORT...")
-                res = engine.execute_order(SYMBOL, 3, TRADE_VOL, LEVERAGE)
-                if res and res.get('success'):
-                    print("[✅] Order SHORT Berhasil! Masuk mode tempur.")
-                    status_mesin = "SHORT"
-                    waktu_buka_posisi = time.time()
-                else:
-                    print(f"[❌] Gagal Open Short: {res.get('error', 'Unknown Error')}")
-                    time.sleep(5)
+                elif rsi_sekarang >= RSI_OVERBOUGHT:
+                    print(f"\n[🧊] RSI {rsi_sekarang:.1f} (OVERBOUGHT)! MEMBUKA POSISI SHORT...")
+                    res = engine.execute_order(SYMBOL, 3, TRADE_VOL, LEVERAGE)
+                    if res and res.get('success'):
+                        print("[✅] SHORT Berhasil! Menahan posisi selama 3 menit.")
+                        status_mesin = "SHORT"
+                        waktu_buka_posisi = time.time()
+                    else:
+                        print(f"\n[❌] Gagal Open: {res}")
+                        time.sleep(2)
 
-        elif status_mesin == "LONG":
-            if (timestamp_sekarang - waktu_buka_posisi) >= HOLD_TIME_LIMIT:
-                print(f"\n[⏰] Waktu Tahan ({HOLD_TIME_LIMIT}s) Habis! MENUTUP POSISI LONG (TAKE PROFIT/CUT LOSS)...")
-                res = engine.execute_order(SYMBOL, 2, TRADE_VOL, LEVERAGE) # 2 = Close Long
-                if res and res.get('success'):
-                    print("[✅] Posisi LONG Tertutup Aman. Masuk mode pendinginan.")
-                    saldo = engine.get_balance() # Refresh saldo
-                    status_mesin = "COOLDOWN"
-                    waktu_mulai_cooldown = time.time()
+            elif status_mesin == "LONG":
+                if (timestamp_sekarang - waktu_buka_posisi) >= HOLD_TIME_LIMIT:
+                    print(f"\n[⏰] Waktu Habis! MENUTUP POSISI LONG (Take Profit/Cut Loss)...")
+                    res = engine.execute_order(SYMBOL, 2, TRADE_VOL, LEVERAGE) 
+                    if res and res.get('success'):
+                        saldo = engine.get_balance() 
+                        status_mesin = "COOLDOWN"
+                        waktu_mulai_cooldown = time.time()
 
-        elif status_mesin == "SHORT":
-            if (timestamp_sekarang - waktu_buka_posisi) >= HOLD_TIME_LIMIT:
-                print(f"\n[⏰] Waktu Tahan ({HOLD_TIME_LIMIT}s) Habis! MENUTUP POSISI SHORT (TAKE PROFIT/CUT LOSS)...")
-                res = engine.execute_order(SYMBOL, 4, TRADE_VOL, LEVERAGE) # 4 = Close Short
-                if res and res.get('success'):
-                    print("[✅] Posisi SHORT Tertutup Aman. Masuk mode pendinginan.")
-                    saldo = engine.get_balance() # Refresh saldo
-                    status_mesin = "COOLDOWN"
-                    waktu_mulai_cooldown = time.time()
+            elif status_mesin == "SHORT":
+                if (timestamp_sekarang - waktu_buka_posisi) >= HOLD_TIME_LIMIT:
+                    print(f"\n[⏰] Waktu Habis! MENUTUP POSISI SHORT (Take Profit/Cut Loss)...")
+                    res = engine.execute_order(SYMBOL, 4, TRADE_VOL, LEVERAGE) 
+                    if res and res.get('success'):
+                        saldo = engine.get_balance() 
+                        status_mesin = "COOLDOWN"
+                        waktu_mulai_cooldown = time.time()
 
-        elif status_mesin == "COOLDOWN":
-            if (timestamp_sekarang - waktu_mulai_cooldown) >= COOLDOWN_TIME:
-                print(f"\n[🔄] Pendinginan selesai. Radar kembali aktif mencari mangsa.")
-                status_mesin = "MENGINTAI"
+            elif status_mesin == "COOLDOWN":
+                if (timestamp_sekarang - waktu_mulai_cooldown) >= COOLDOWN_TIME:
+                    print(f"\n[🔄] Pendinginan selesai. Radar siap mencari mangsa.")
+                    status_mesin = "MENGINTAI"
 
-        time.sleep(2) # Ritme detak jantung server: 2 detik
+        time.sleep(2) 
 
-# ==========================================
-# [5] PELINDUNG UTAMA (CRASH IMMUNITY)
-# ==========================================
 if __name__ == "__main__":
     while True:
         try:
             run_autonomous_bot()
         except KeyboardInterrupt:
-            print("\n\n[!] Mesin dimatikan secara manual oleh Direktur. Selamat berhiatus!")
+            print("\n\n[!] Mesin dimatikan secara manual. Selamat tidur, Direktur!")
             sys.exit()
         except Exception as e:
-            print(f"\n\n[☠️] TERJADI CRASH SISTEM / KONEKSI: {e}")
-            print("[⚙️] Protokol Auto-Revive aktif. Mem-booting ulang mesin dalam 15 detik...")
-            time.sleep(15)
+            print(f"\n\n[☠️] SYSTEM CRASH / KONEKSI PUTUS: {e}")
+            print("[⚙️] Auto-Revive aktif. Memulai ulang dalam 5 detik...")
+            time.sleep(5)
+                             
